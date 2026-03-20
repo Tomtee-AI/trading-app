@@ -1,3 +1,5 @@
+# Acknowledgements
+Inspired by Brian Roemmele 5000 Day to the End of Work series
 # Zero Human Company
 
 Local-first multi-agent wealth management and trading research system built with **Python**, **CrewAI**, and **Ollama**.
