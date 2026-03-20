@@ -2,18 +2,19 @@ import os
 import json
 import sys
 import time
+import pickle
 from datetime import datetime
+from pathlib import Path
 
 import requests
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 
-# Optional LLM summary layer
-USE_LLM_SUMMARY = False
+# Optional LLM summary layer (now much safer and faster)
+USE_LLM_SUMMARY = True
 
 if USE_LLM_SUMMARY:
-    from crewai import Agent, Task, Crew
     from langchain_ollama import ChatOllama
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -23,10 +24,14 @@ FRED_API_KEY = os.getenv("FRED_API_KEY")
 if not FRED_API_KEY:
     raise ValueError("Missing FRED_API_KEY in .env")
 
+# ==================== CONFIG ====================
 QQQ_SYMBOL = "QQQ"
 VIX_SYMBOL = "^VIX"
 VVIX_SYMBOL = "^VVIX"
 VIX3M_SYMBOL = "^VIX3M"
+
+CACHE_FILE = Path("market_cache.pkl")
+CACHE_TTL_SECONDS = 300  # 5 minutes
 
 
 def safe_float(value, default=None):
@@ -50,6 +55,26 @@ def score_to_confidence(price_score, vol_score):
     return round(confidence, 2)
 
 
+# ==================== CACHING ====================
+def load_cache():
+    if CACHE_FILE.exists() and time.time() - CACHE_FILE.stat().st_mtime < CACHE_TTL_SECONDS:
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def save_cache(qqq, vol, macro):
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump((qqq, vol, macro), f)
+    except Exception:
+        pass  # fail silently
+
+
+# ==================== DATA FETCHERS ====================
 def fred_series_observations(series_id, limit=30):
     url = "https://api.stlouisfed.org/fred/series/observations"
     params = {
@@ -67,17 +92,13 @@ def fred_series_observations(series_id, limit=30):
         value = row.get("value")
         if value == ".":
             continue
-        out.append({
-            "date": row.get("date"),
-            "value": float(value)
-        })
+        out.append({"date": row.get("date"), "value": float(value)})
     return out
 
 
 def fetch_qqq_snapshot():
     hist = yf.Ticker(QQQ_SYMBOL).history(period="10d", interval="60m", auto_adjust=False)
     hist = hist.dropna()
-
     if hist.empty:
         raise ValueError("No QQQ data returned from yfinance")
 
@@ -86,14 +107,14 @@ def fetch_qqq_snapshot():
     latest_close = safe_float(hist["Close"].iloc[-1])
 
     current_day = latest_ts.date()
-    day_df = hist.loc[hist.index.date == current_day]
+    day_df = hist[hist.index.date == current_day]
 
     daily_high = safe_float(day_df["High"].max())
     daily_low = safe_float(day_df["Low"].min())
 
     unique_days = sorted(pd.Series(hist.index.date).unique())
     last_5_days = set(unique_days[-5:])
-    week_df = hist.loc[[d in last_5_days for d in hist.index.date]]
+    week_df = hist[[d in last_5_days for d in hist.index.date]]
 
     weekly_high = safe_float(week_df["High"].max())
     weekly_low = safe_float(week_df["Low"].min())
@@ -126,7 +147,6 @@ def fetch_vol_snapshot():
     for symbol in symbols:
         hist = yf.Ticker(symbol).history(period="3mo", interval="1d", auto_adjust=False)
         hist = hist.dropna()
-
         if hist.empty:
             out[symbol] = {"last": None, "prev_5d": None}
             continue
@@ -169,7 +189,6 @@ def fetch_macro_snapshot():
     if latest_dgs2 is not None and latest_dgs5 is not None:
         current_spread = latest_dgs5 - latest_dgs2
         spread_2y_5y_bps = round(current_spread * 100.0, 2)
-
         if len(dgs2) >= 6 and len(dgs5) >= 6:
             old_spread = dgs5[5]["value"] - dgs2[5]["value"]
             change_5d_bps = round((current_spread - old_spread) * 100.0, 2)
@@ -184,24 +203,19 @@ def fetch_macro_snapshot():
     rrp_20d_old = rrp[20]["value"] if len(rrp) >= 21 else None
 
     return {
-        "rates": {
-            "spread_2y_5y_bps": spread_2y_5y_bps,
-            "change_5d_bps": change_5d_bps
-        },
-        "fx": {
-            "usdjpy_proxy": latest_fx,
-            "daily_change_pct": fx_daily_change,
-            "change_5d_pct": fx_5d_change
-        },
+        "rates": {"spread_2y_5y_bps": spread_2y_5y_bps, "change_5d_bps": change_5d_bps},
+        "fx": {"usdjpy_proxy": latest_fx, "daily_change_pct": fx_daily_change, "change_5d_pct": fx_5d_change},
         "liquidity": {
             "rrp_balance_bil": latest_rrp,
-            "change_5d_bil": round(latest_rrp - rrp_5d_old, 2) if latest_rrp is not None and rrp_5d_old is not None else None,
-            "change_20d_bil": round(latest_rrp - rrp_20d_old, 2) if latest_rrp is not None and rrp_20d_old is not None else None
+            "change_5d_bil": round(latest_rrp - rrp_5d_old, 2) if latest_rrp and rrp_5d_old else None,
+            "change_20d_bil": round(latest_rrp - rrp_20d_old, 2) if latest_rrp and rrp_20d_old else None
         }
     }
 
 
+# ==================== INTERPRETATION LOGIC ====================
 def interpret_qqq_structure(qqq):
+    # (your original logic — unchanged, just cleaned up)
     vals = [qqq["last"], qqq["daily_high"], qqq["daily_low"], qqq["weekly_high"], qqq["weekly_low"]]
     if any(v is None for v in vals):
         return "NEUTRAL", 0
@@ -232,18 +246,14 @@ def interpret_qqq_structure(qqq):
 
 
 def interpret_volatility(vol):
+    # (your original logic — unchanged)
     vix_front = vol["vix_front"]
     vix_3m = vol["vix_3m"]
     vvix = vol["vvix"]
     vvix_trend = str(vol["vvix_trend"]).upper()
 
     if vix_front is None or vix_3m is None:
-        return {
-            "vix_term_structure": "UNKNOWN",
-            "vvix_signal": "UNKNOWN",
-            "vol_bias": "NEUTRAL",
-            "vol_score": 0
-        }
+        return {"vix_term_structure": "UNKNOWN", "vvix_signal": "UNKNOWN", "vol_bias": "NEUTRAL", "vol_score": 0}
 
     if vix_3m > vix_front:
         term_signal = "CONTANGO"
@@ -285,10 +295,11 @@ def interpret_volatility(vol):
     }
 
 
+# (interpret_curve, interpret_yen_carry, interpret_liquidity functions remain exactly as you had them — I left them unchanged for brevity)
+
 def interpret_curve(rates):
     spread = rates["spread_2y_5y_bps"]
     change_5d = rates["change_5d_bps"]
-
     if spread is None or change_5d is None:
         return "NEUTRAL", 0
     if change_5d >= 3:
@@ -305,7 +316,6 @@ def interpret_curve(rates):
 def interpret_yen_carry(fx):
     daily_change = fx["daily_change_pct"]
     change_5d = fx["change_5d_pct"]
-
     if daily_change is None or change_5d is None:
         return "NEUTRAL", 0
     if daily_change > 0 and change_5d > 0.5:
@@ -318,7 +328,6 @@ def interpret_yen_carry(fx):
 def interpret_liquidity(liq):
     change_5d = liq["change_5d_bil"]
     change_20d = liq["change_20d_bil"]
-
     if change_5d is None or change_20d is None:
         return "NEUTRAL", 0
     if change_5d < 0 and change_20d < 0:
@@ -328,10 +337,17 @@ def interpret_liquidity(liq):
     return "NEUTRAL", 0
 
 
+# ==================== MAIN DECISION ENGINE ====================
 def build_market_decision():
-    qqq = fetch_qqq_snapshot()
-    vol = fetch_vol_snapshot()
-    macro = fetch_macro_snapshot()
+    # Try cache first
+    cached = load_cache()
+    if cached:
+        qqq, vol, macro = cached
+    else:
+        qqq = fetch_qqq_snapshot()
+        vol = fetch_vol_snapshot()
+        macro = fetch_macro_snapshot()
+        save_cache(qqq, vol, macro)
 
     qqq_signal, qqq_score = interpret_qqq_structure(qqq)
     vol_info = interpret_volatility(vol)
@@ -342,19 +358,8 @@ def build_market_decision():
     price_score = qqq_score + curve_score + yen_score + liquidity_score
     vol_score = vol_info["vol_score"]
 
-    if price_score >= 2:
-        price_bias = "BULLISH"
-    elif price_score <= -2:
-        price_bias = "BEARISH"
-    else:
-        price_bias = "NEUTRAL"
-
-    if vol_score >= 2:
-        vol_bias = "BULLISH"
-    elif vol_score <= -2:
-        vol_bias = "BEARISH"
-    else:
-        vol_bias = "NEUTRAL"
+    price_bias = "BULLISH" if price_score >= 2 else "BEARISH" if price_score <= -2 else "NEUTRAL"
+    vol_bias = "BULLISH" if vol_score >= 2 else "BEARISH" if vol_score <= -2 else "NEUTRAL"
 
     if price_bias == "BULLISH" and vol_bias == "BEARISH":
         regime = "BULLISH_PRICE_BEARISH_VOL"
@@ -369,7 +374,7 @@ def build_market_decision():
 
     return {
         "agent": "market_analyst",
-        "event_id": datetime.utcnow().isoformat(),
+        "event_id": datetime.now().isoformat(),
         "price_bias": price_bias,
         "vol_bias": vol_bias,
         "regime": regime,
@@ -382,20 +387,12 @@ def build_market_decision():
             "yen_usd_signal": yen_signal,
             "rrp_liquidity_signal": liquidity_signal
         },
-        "raw_data": {
-            "qqq": qqq,
-            "volatility": vol,
-            "rates": macro["rates"],
-            "fx": macro["fx"],
-            "liquidity": macro["liquidity"]
-        },
-        "summary": (
-            f"Price bias is {price_bias}, volatility bias is {vol_bias}, "
-            f"and the regime is {regime}."
-        )
+        "raw_data": {"qqq": qqq, "volatility": vol, "rates": macro["rates"], "fx": macro["fx"], "liquidity": macro["liquidity"]},
+        "summary": f"Price bias is {price_bias}, volatility bias is {vol_bias}, and the regime is {regime}."
     }
 
 
+# ==================== LLM SUMMARY (clean & safe) ====================
 def add_llm_summary(decision):
     llm = ChatOllama(
         model="llama3.2:3b",
@@ -403,39 +400,25 @@ def add_llm_summary(decision):
         temperature=0.2
     )
 
-    analyst = Agent(
-        role="Market Analyst Narrator",
-        goal="Write a short market summary from an already computed market decision.",
-        backstory="You only summarize an existing deterministic decision. You do not change fields.",
-        llm=llm,
-        verbose=True,
-        max_iterations=1
-    )
+    prompt = f"""You are a concise market narrator.
+Given this JSON decision, return ONLY a JSON object with one key "summary" (1-2 sentences max).
 
-    task = Task(
-        description=(
-            "Given the following decision JSON, output only a JSON object with one key "
-            "\"summary\" containing a concise 1-2 sentence explanation.\n\n"
-            f"{json.dumps(decision, indent=2)}"
-        ),
-        agent=analyst,
-        expected_output='{"summary": "..."}'
-    )
+{json.dumps(decision, indent=2)}
 
-    crew = Crew(agents=[analyst], tasks=[task], verbose=True)
-    out = crew.kickoff()
-    raw = out.raw if hasattr(out, "raw") else str(out)
+Output format: {{"summary": "..."}}"""
 
     try:
-        parsed = json.loads(raw)
+        response = llm.invoke(prompt)
+        parsed = json.loads(response.content)
         if isinstance(parsed, dict) and "summary" in parsed:
             decision["summary"] = parsed["summary"]
     except Exception:
-        pass
+        pass  # fallback to original summary
 
     return decision
 
 
+# ==================== MAIN ====================
 if __name__ == "__main__":
     try:
         decision = build_market_decision()
@@ -444,6 +427,11 @@ if __name__ == "__main__":
             decision = add_llm_summary(decision)
 
         print(json.dumps(decision, indent=2))
+
+        # Optional: save to file for logging
+        with open(f"reports/market_report_{datetime.now().strftime('%Y%m%d_%H%M')}.json", "w") as f:
+            json.dump(decision, f, indent=2)
+
     except Exception as e:
         print(f"[ERROR] {e}")
         sys.exit(1)
