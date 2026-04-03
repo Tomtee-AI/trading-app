@@ -1,498 +1,495 @@
 #!/usr/bin/env python3
 """
-metals_trade_analyst.py
+trade_analyst_metals.py
 
-Standalone Trade Analyst focused on relative-value opportunities
-in the metals complex only.
+Standalone Trade Analyst for metals relative-value trading.
 
-What it does
-------------
-- Pulls daily futures prices for:
+Focus
+-----
+- Metals complex only:
     GC=F  Gold
     SI=F  Silver
     HG=F  Copper
     PL=F  Platinum
     PA=F  Palladium
-- Tries to use a current price from intraday history
-- Falls back to the previous daily close if current price is unavailable
-- Calculates pairwise rolling return correlations
-- Estimates hedge-ratio-adjusted log-spread z-scores
-- Ranks relative-value opportunities
-- Flags which leg appears expensive vs cheap
-
-Install
--------
-pip install yfinance pandas numpy
+- Relative-value / mean-reversion style
+- Uses current price when available
+- Falls back to previous daily close when current price is unavailable
+- Outputs JSON in a structure similar to the market analyst
 
 Run
 ---
-python metals_trade_analyst.py
-python metals_trade_analyst.py --json-out metals_report.json
-python metals_trade_analyst.py --min-corr 0.50 --min-abs-z 1.0
+python trade_analyst_metals.py
 """
 
-from __future__ import annotations
-
-import argparse
-import itertools
+import os
 import json
-import math
 import sys
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+import time
+import pickle
+import math
+import itertools
+from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
+# -------------------- OPTIONAL LLM SUMMARY --------------------
+# Kept off by default so this remains runnable without extra dependencies.
+USE_LLM_SUMMARY = False
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1")
 
-METALS_UNIVERSE = {
-    "GC=F": "Gold",
-    "SI=F": "Silver",
-    "HG=F": "Copper",
-    "PL=F": "Platinum",
-    "PA=F": "Palladium",
+if USE_LLM_SUMMARY:
+    from langchain_ollama import ChatOllama
+
+# -------------------- BOOTSTRAP --------------------
+sys.stdout.reconfigure(encoding="utf-8")
+
+# -------------------- CONFIG --------------------
+REPORTS_DIR = Path("reports")
+REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+CACHE_FILE = Path("trade_analyst_metals_cache.pkl")
+CACHE_TTL_SECONDS = 300
+
+METALS_SYMBOLS = {
+    "GC=F": "gold",
+    "SI=F": "silver",
+    "HG=F": "copper",
+    "PL=F": "platinum",
+    "PA=F": "palladium",
 }
 
+DAILY_PERIOD = "2y"
+DAILY_INTERVAL = "1d"
 
-@dataclass
-class AnalystConfig:
-    daily_period: str = "2y"
-    daily_interval: str = "1d"
-    current_intervals: Tuple[str, ...] = ("1m", "5m", "15m")
-    current_periods: Tuple[str, ...] = ("1d", "5d", "5d")
-    corr_window: int = 126
-    spread_window: int = 126
-    zscore_window: int = 63
-    min_corr: float = 0.45
-    min_abs_z: float = 1.25
-    max_candidates: int = 10
-    threads: bool = False
-    use_current_price: bool = True
+CURRENT_PRICE_ATTEMPTS: List[Tuple[str, str]] = [
+    ("1d", "1m"),
+    ("5d", "5m"),
+    ("5d", "15m"),
+]
 
-
-@dataclass
-class PriceSnapshot:
-    symbol: str
-    name: str
-    effective_price: float
-    price_source: str
-    source_timestamp_utc: Optional[str]
-    previous_close: float
+CORR_WINDOW = 126
+BETA_WINDOW = 126
+ZSCORE_WINDOW = 63
+MIN_CORRELATION = 0.45
+MIN_ABS_ZSCORE = 1.25
+MAX_CANDIDATES = 10
 
 
-@dataclass
-class PairSignal:
-    pair: str
-    symbol_a: str
-    symbol_b: str
-    name_a: str
-    name_b: str
-    correlation: float
-    hedge_ratio_beta: float
-    last_close_zscore: float
-    current_zscore: float
-    expensive_symbol: str
-    cheap_symbol: str
-    recommendation: str
-    confidence: float
-    score: float
-    rationale: str
+# -------------------- HELPERS --------------------
+def now_iso() -> str:
+    return datetime.now().isoformat()
 
 
-class MetalsTradeAnalyst:
-    def __init__(self, config: AnalystConfig):
-        self.config = config
-        self.universe = METALS_UNIVERSE.copy()
+def safe_float(value, default: Optional[float] = None) -> Optional[float]:
+    try:
+        if value is None or pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
 
-    def fetch_daily_closes(self) -> pd.DataFrame:
-        symbols = list(self.universe.keys())
 
-        raw = yf.download(
-            tickers=symbols,
-            period=self.config.daily_period,
-            interval=self.config.daily_interval,
-            auto_adjust=False,
-            progress=False,
-            threads=self.config.threads,
-            group_by="column",
-        )
+def clamp(value: float, low: float, high: float) -> float:
+    return max(low, min(high, value))
 
-        if raw is None or raw.empty:
-            raise RuntimeError("No daily market data returned from yfinance.")
 
-        closes = self._extract_close_frame(raw, symbols)
-        closes = closes.dropna(how="all").sort_index()
+def load_cache():
+    if CACHE_FILE.exists() and time.time() - CACHE_FILE.stat().st_mtime < CACHE_TTL_SECONDS:
+        try:
+            with open(CACHE_FILE, "rb") as f:
+                return pickle.load(f)
+        except Exception:
+            return None
+    return None
 
-        if closes.empty:
-            raise RuntimeError("Daily close frame is empty after cleaning.")
 
-        available = [c for c in closes.columns if c in symbols]
-        closes = closes[available]
+def save_cache(payload):
+    try:
+        with open(CACHE_FILE, "wb") as f:
+            pickle.dump(payload, f)
+    except Exception:
+        pass
 
-        if closes.shape[1] < 2:
-            raise RuntimeError("Need at least two symbols with data to run relative-value analysis.")
 
-        return closes
+def compare_level(price: Optional[float], level: Optional[float], near_pct: float = 0.01) -> str:
+    if price is None or level is None or level == 0:
+        return "UNKNOWN"
+    diff_pct = (price / level) - 1.0
+    if abs(diff_pct) <= near_pct:
+        return "NEAR"
+    return "ABOVE" if diff_pct > 0 else "BELOW"
 
-    @staticmethod
-    def _extract_close_frame(raw: pd.DataFrame, symbols: List[str]) -> pd.DataFrame:
-        if isinstance(raw.columns, pd.MultiIndex):
-            level0 = list(raw.columns.get_level_values(0))
-            level1 = list(raw.columns.get_level_values(1))
 
-            if "Close" in level0:
-                closes = raw["Close"].copy()
-            elif "Close" in level1:
-                closes = raw.xs("Close", axis=1, level=1).copy()
-            else:
-                raise RuntimeError("Could not find Close columns in downloaded price frame.")
-        else:
-            if "Close" not in raw.columns:
-                raise RuntimeError("Downloaded single-ticker frame missing Close column.")
-            closes = raw[["Close"]].copy()
-            closes.columns = [symbols[0]]
+def fetch_history(symbol: str, period: str = DAILY_PERIOD, interval: str = DAILY_INTERVAL) -> pd.DataFrame:
+    df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
+    df = df.dropna(how="all")
+    if df.empty:
+        raise ValueError(f"No history returned for {symbol}")
+    df.index = pd.to_datetime(df.index)
+    if getattr(df.index, "tz", None) is not None:
+        df.index = df.index.tz_localize(None)
+    return df
 
-        closes = closes.apply(pd.to_numeric, errors="coerce")
-        return closes
 
-    def fetch_price_snapshots(self, daily_closes: pd.DataFrame) -> Dict[str, PriceSnapshot]:
-        snapshots: Dict[str, PriceSnapshot] = {}
+def try_fetch_current_price(symbol: str) -> Tuple[Optional[float], Optional[str], str]:
+    """
+    Returns:
+        price, timestamp_utc, source_label
+    """
+    ticker = yf.Ticker(symbol)
 
-        for symbol, name in self.universe.items():
-            if symbol not in daily_closes.columns:
+    for period, interval in CURRENT_PRICE_ATTEMPTS:
+        try:
+            df = ticker.history(period=period, interval=interval, auto_adjust=False, prepost=True)
+            if df is None or df.empty or "Close" not in df.columns:
                 continue
 
-            previous_close_series = daily_closes[symbol].dropna()
-            if previous_close_series.empty:
+            close_series = df["Close"].dropna()
+            if close_series.empty:
                 continue
 
-            previous_close = float(previous_close_series.iloc[-1])
+            px = safe_float(close_series.iloc[-1])
+            if px is None or px <= 0:
+                continue
 
-            effective_price = previous_close
-            price_source = "previous_close"
-            source_timestamp = None
-
-            if self.config.use_current_price:
-                current_price, current_ts = self._try_fetch_current_price(symbol)
-                if current_price is not None and np.isfinite(current_price) and current_price > 0:
-                    effective_price = float(current_price)
-                    price_source = "current"
-                    source_timestamp = current_ts
-
-            snapshots[symbol] = PriceSnapshot(
-                symbol=symbol,
-                name=name,
-                effective_price=float(effective_price),
-                price_source=price_source,
-                source_timestamp_utc=source_timestamp,
-                previous_close=float(previous_close),
-            )
-
-        return snapshots
-
-    def _try_fetch_current_price(self, symbol: str) -> Tuple[Optional[float], Optional[str]]:
-        ticker = yf.Ticker(symbol)
-
-        for period, interval in zip(self.config.current_periods, self.config.current_intervals):
+            ts = close_series.index[-1]
+            ts_utc = None
             try:
-                df = ticker.history(
-                    period=period,
-                    interval=interval,
-                    auto_adjust=False,
-                    prepost=True,
-                )
-
-                if df is None or df.empty or "Close" not in df.columns:
-                    continue
-
-                close_series = df["Close"].dropna()
-                if close_series.empty:
-                    continue
-
-                px = float(close_series.iloc[-1])
-                ts = close_series.index[-1]
-
-                ts_utc = None
-                try:
-                    if getattr(ts, "tzinfo", None) is not None:
-                        ts_utc = ts.tz_convert("UTC").isoformat()
-                    else:
-                        ts_utc = pd.Timestamp(ts).tz_localize("UTC").isoformat()
-                except Exception:
-                    ts_utc = None
-
-                return px, ts_utc
-
+                ts = pd.Timestamp(ts)
+                if ts.tzinfo is None:
+                    ts = ts.tz_localize("UTC")
+                else:
+                    ts = ts.tz_convert("UTC")
+                ts_utc = ts.isoformat()
             except Exception:
-                continue
+                ts_utc = None
 
-        return None, None
+            return px, ts_utc, "current"
 
-    def analyze(self, daily_closes: pd.DataFrame, snapshots: Dict[str, PriceSnapshot]) -> Dict[str, object]:
-        usable_symbols = [s for s in daily_closes.columns if s in snapshots]
-        px = daily_closes[usable_symbols].dropna(how="all").copy()
+        except Exception:
+            continue
 
-        if px.shape[1] < 2:
-            raise RuntimeError("Not enough symbols with both history and snapshots.")
-
-        px = px.where(px > 0)
-
-        log_px = np.log(px)
-        log_ret = log_px.diff()
-
-        pair_signals: List[PairSignal] = []
-
-        for symbol_a, symbol_b in itertools.combinations(usable_symbols, 2):
-            signal = self._analyze_pair(
-                symbol_a=symbol_a,
-                symbol_b=symbol_b,
-                log_px=log_px,
-                log_ret=log_ret,
-                snapshots=snapshots,
-            )
-            if signal is not None:
-                pair_signals.append(signal)
-
-        pair_signals.sort(key=lambda x: x.score, reverse=True)
-        filtered_signals = [s for s in pair_signals if abs(s.current_zscore) >= self.config.min_abs_z]
-        filtered_signals = filtered_signals[: self.config.max_candidates]
-
-        diagnostics = [
-            {
-                "symbol": snap.symbol,
-                "name": snap.name,
-                "effective_price": snap.effective_price,
-                "previous_close": snap.previous_close,
-                "price_source": snap.price_source,
-                "source_timestamp_utc": snap.source_timestamp_utc,
-            }
-            for snap in snapshots.values()
-        ]
-
-        report = {
-            "agent_id": "trade_analyst_metals_rv",
-            "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "complex": "metals",
-            "methodology": {
-                "relative_value_measure": "hedge_ratio_adjusted_log_spread_zscore",
-                "correlation_window_days": self.config.corr_window,
-                "spread_window_days": self.config.spread_window,
-                "zscore_window_days": self.config.zscore_window,
-                "min_correlation": self.config.min_corr,
-                "min_abs_zscore": self.config.min_abs_z,
-                "current_price_preferred": self.config.use_current_price,
-                "current_price_fallback": "previous_daily_close",
-            },
-            "snapshots": diagnostics,
-            "trade_candidates": [asdict(s) for s in filtered_signals],
-            "all_pair_count": len(pair_signals),
-            "candidate_count": len(filtered_signals),
-        }
-
-        return report
-
-    def _analyze_pair(
-        self,
-        symbol_a: str,
-        symbol_b: str,
-        log_px: pd.DataFrame,
-        log_ret: pd.DataFrame,
-        snapshots: Dict[str, PriceSnapshot],
-    ) -> Optional[PairSignal]:
-        pair_log_px = log_px[[symbol_a, symbol_b]].dropna()
-        pair_ret = log_ret[[symbol_a, symbol_b]].dropna()
-
-        min_needed = max(self.config.corr_window, self.config.spread_window, self.config.zscore_window) + 5
-        if len(pair_log_px) < min_needed or len(pair_ret) < min_needed:
-            return None
-
-        corr_sample = pair_ret.tail(self.config.corr_window)
-        corr = corr_sample[symbol_a].corr(corr_sample[symbol_b])
-
-        if pd.isna(corr) or corr < self.config.min_corr:
-            return None
-
-        spread_sample = pair_log_px.tail(self.config.spread_window)
-
-        x = spread_sample[symbol_b].values
-        y = spread_sample[symbol_a].values
-
-        var_x = np.var(x, ddof=1)
-        if not np.isfinite(var_x) or var_x <= 0:
-            return None
-
-        cov_xy = np.cov(x, y, ddof=1)[0, 1]
-        beta = float(cov_xy / var_x)
-
-        if not np.isfinite(beta):
-            return None
-
-        hist_spread = pair_log_px[symbol_a] - beta * pair_log_px[symbol_b]
-        hist_spread = hist_spread.dropna()
-        if len(hist_spread) < self.config.zscore_window:
-            return None
-
-        z_window = hist_spread.tail(self.config.zscore_window)
-        mu = float(z_window.mean())
-        sigma = float(z_window.std(ddof=1))
-
-        if not np.isfinite(sigma) or sigma <= 1e-10:
-            return None
-
-        last_close_spread = float(hist_spread.iloc[-1])
-        last_close_z = float((last_close_spread - mu) / sigma)
-
-        a_eff = snapshots[symbol_a].effective_price
-        b_eff = snapshots[symbol_b].effective_price
-
-        if a_eff <= 0 or b_eff <= 0:
-            return None
-
-        current_spread = math.log(a_eff) - beta * math.log(b_eff)
-        current_z = float((current_spread - mu) / sigma)
-
-        if current_z > 0:
-            expensive_symbol = symbol_a
-            cheap_symbol = symbol_b
-        else:
-            expensive_symbol = symbol_b
-            cheap_symbol = symbol_a
-
-        recommendation = f"SELL {expensive_symbol} / BUY {cheap_symbol}"
-
-        z_strength = min(abs(current_z) / 3.0, 1.0)
-        corr_strength = min(max((corr - self.config.min_corr) / (1.0 - self.config.min_corr + 1e-9), 0.0), 1.0)
-        confidence = round(0.55 * z_strength + 0.45 * corr_strength, 4)
-        score = round(abs(current_z) * max(corr, 0.0), 4)
-
-        name_a = self.universe[symbol_a]
-        name_b = self.universe[symbol_b]
-
-        if expensive_symbol == symbol_a:
-            rationale = (
-                f"{name_a} screens expensive versus {name_b}. "
-                f"The {name_a}/{name_b} hedge-adjusted spread is +{current_z:.2f} standard deviations "
-                f"from its recent mean with {corr:.2f} return correlation."
-            )
-        else:
-            rationale = (
-                f"{name_b} screens expensive versus {name_a}. "
-                f"The {name_a}/{name_b} hedge-adjusted spread is {current_z:.2f} standard deviations "
-                f"from its recent mean with {corr:.2f} return correlation."
-            )
-
-        return PairSignal(
-            pair=f"{symbol_a}__{symbol_b}",
-            symbol_a=symbol_a,
-            symbol_b=symbol_b,
-            name_a=name_a,
-            name_b=name_b,
-            correlation=round(float(corr), 4),
-            hedge_ratio_beta=round(beta, 4),
-            last_close_zscore=round(last_close_z, 4),
-            current_zscore=round(current_z, 4),
-            expensive_symbol=expensive_symbol,
-            cheap_symbol=cheap_symbol,
-            recommendation=recommendation,
-            confidence=confidence,
-            score=score,
-            rationale=rationale,
-        )
+    return None, None, "previous_close"
 
 
-def print_human_summary(report: Dict[str, object]) -> None:
-    print("\n=== METALS TRADE ANALYST ===")
-    print(f"Generated: {report['generated_at_utc']}")
-    print(f"Complex:   {report['complex']}")
-    print(f"Pairs analyzed: {report['all_pair_count']}")
-    print(f"Candidates:     {report['candidate_count']}")
+def build_symbol_features(symbol: str, df: pd.DataFrame) -> Dict[str, object]:
+    close_series = df["Close"].dropna()
+    high_series = df["High"].dropna() if "High" in df.columns else pd.Series(dtype=float)
+    low_series = df["Low"].dropna() if "Low" in df.columns else pd.Series(dtype=float)
 
-    print("\n--- Price Snapshots ---")
-    for snap in report["snapshots"]:
-        ts = snap["source_timestamp_utc"] or "n/a"
-        print(
-            f"{snap['symbol']:>5}  "
-            f"{snap['name']:<10}  "
-            f"effective={snap['effective_price']:.4f}  "
-            f"prev_close={snap['previous_close']:.4f}  "
-            f"source={snap['price_source']:<14}  "
-            f"ts={ts}"
-        )
+    previous_close = safe_float(close_series.iloc[-1]) if not close_series.empty else None
+    daily_high = safe_float(high_series.iloc[-1]) if not high_series.empty else None
+    daily_low = safe_float(low_series.iloc[-1]) if not low_series.empty else None
 
-    print("\n--- Ranked Trade Candidates ---")
-    candidates = report["trade_candidates"]
+    sma_21 = safe_float(close_series.rolling(21).mean().iloc[-1]) if len(close_series) >= 21 else None
+    sma_63 = safe_float(close_series.rolling(63).mean().iloc[-1]) if len(close_series) >= 63 else None
+
+    current_price, current_ts, source = try_fetch_current_price(symbol)
+    effective_price = current_price if current_price is not None else previous_close
+
+    return {
+        "symbol": symbol,
+        "label": METALS_SYMBOLS[symbol],
+        "as_of": str(df.index[-1]),
+        "rows": int(len(df)),
+        "previous_close": previous_close,
+        "effective_price": safe_float(effective_price),
+        "price_source": source,
+        "source_timestamp_utc": current_ts,
+        "daily_high": daily_high,
+        "daily_low": daily_low,
+        "sma_21": sma_21,
+        "sma_63": sma_63,
+        "vs_sma_21": compare_level(effective_price, sma_21),
+        "vs_sma_63": compare_level(effective_price, sma_63),
+    }
+
+
+def fetch_market_snapshot() -> Dict[str, object]:
+    symbol_frames: Dict[str, pd.DataFrame] = {}
+    symbols_summary: Dict[str, Dict[str, object]] = {}
+    errors: Dict[str, str] = {}
+
+    for symbol in METALS_SYMBOLS:
+        try:
+            df = fetch_history(symbol)
+            symbol_frames[symbol] = df
+            symbols_summary[symbol] = build_symbol_features(symbol, df)
+        except Exception as exc:
+            errors[symbol] = str(exc)
+
+    return {
+        "fetched_at": now_iso(),
+        "symbols": symbols_summary,
+        "frames": symbol_frames,
+        "errors": errors,
+    }
+
+
+# -------------------- PAIR ANALYTICS --------------------
+def calculate_pair_signal(
+    symbol_a: str,
+    symbol_b: str,
+    closes: pd.DataFrame,
+    symbol_features: Dict[str, Dict[str, object]],
+) -> Optional[Dict[str, object]]:
+    pair_df = closes[[symbol_a, symbol_b]].dropna()
+    if len(pair_df) < max(CORR_WINDOW, BETA_WINDOW, ZSCORE_WINDOW) + 5:
+        return None
+
+    log_px = np.log(pair_df)
+    log_ret = log_px.diff().dropna()
+
+    corr_sample = log_ret.tail(CORR_WINDOW)
+    corr = safe_float(corr_sample[symbol_a].corr(corr_sample[symbol_b]))
+    if corr is None or corr < MIN_CORRELATION:
+        return None
+
+    beta_sample = log_px.tail(BETA_WINDOW)
+    x = beta_sample[symbol_b].values
+    y = beta_sample[symbol_a].values
+
+    var_x = np.var(x, ddof=1)
+    if not np.isfinite(var_x) or var_x <= 0:
+        return None
+
+    cov_xy = np.cov(x, y, ddof=1)[0, 1]
+    beta = safe_float(cov_xy / var_x)
+    if beta is None or not np.isfinite(beta):
+        return None
+
+    hist_spread = (log_px[symbol_a] - beta * log_px[symbol_b]).dropna()
+    z_window = hist_spread.tail(ZSCORE_WINDOW)
+    if len(z_window) < ZSCORE_WINDOW:
+        return None
+
+    mu = safe_float(z_window.mean())
+    sigma = safe_float(z_window.std(ddof=1))
+    if mu is None or sigma is None or sigma <= 1e-10:
+        return None
+
+    last_close_spread = safe_float(hist_spread.iloc[-1])
+    last_close_z = safe_float((last_close_spread - mu) / sigma)
+
+    price_a = symbol_features[symbol_a].get("effective_price")
+    price_b = symbol_features[symbol_b].get("effective_price")
+    if price_a in (None, 0) or price_b in (None, 0):
+        return None
+
+    current_spread = math.log(float(price_a)) - beta * math.log(float(price_b))
+    current_z = safe_float((current_spread - mu) / sigma)
+    if current_z is None:
+        return None
+
+    if current_z > 0:
+        expensive_symbol = symbol_a
+        cheap_symbol = symbol_b
+    else:
+        expensive_symbol = symbol_b
+        cheap_symbol = symbol_a
+
+    z_strength = min(abs(current_z) / 3.0, 1.0)
+    corr_strength = min(max((corr - MIN_CORRELATION) / (1.0 - MIN_CORRELATION + 1e-9), 0.0), 1.0)
+    confidence = round(0.55 * z_strength + 0.45 * corr_strength, 2)
+    score = round(abs(current_z) * corr, 4)
+
+    recommendation = f"SELL {expensive_symbol} / BUY {cheap_symbol}"
+    rationale = (
+        f"{METALS_SYMBOLS[expensive_symbol]} screens expensive relative to {METALS_SYMBOLS[cheap_symbol]}. "
+        f"The hedge-adjusted spread is {current_z:.2f} standard deviations from its {ZSCORE_WINDOW}-day mean "
+        f"with {corr:.2f} rolling return correlation."
+    )
+
+    return {
+        "pair": f"{symbol_a}__{symbol_b}",
+        "pair_label": f"{METALS_SYMBOLS[symbol_a]}__{METALS_SYMBOLS[symbol_b]}",
+        "symbol_a": symbol_a,
+        "symbol_b": symbol_b,
+        "label_a": METALS_SYMBOLS[symbol_a],
+        "label_b": METALS_SYMBOLS[symbol_b],
+        "correlation": round(float(corr), 4),
+        "hedge_ratio_beta": round(float(beta), 4),
+        "last_close_zscore": round(float(last_close_z), 4),
+        "current_zscore": round(float(current_z), 4),
+        "expensive_symbol": expensive_symbol,
+        "cheap_symbol": cheap_symbol,
+        "expensive_label": METALS_SYMBOLS[expensive_symbol],
+        "cheap_label": METALS_SYMBOLS[cheap_symbol],
+        "recommendation": recommendation,
+        "regime": "MEAN_REVERSION_SHORT_EXPENSIVE_LONG_CHEAP",
+        "confidence": confidence,
+        "score": score,
+        "rationale": rationale,
+        "inputs": {
+            "price_a": round(float(price_a), 4),
+            "price_b": round(float(price_b), 4),
+            "price_a_source": symbol_features[symbol_a].get("price_source"),
+            "price_b_source": symbol_features[symbol_b].get("price_source"),
+        },
+    }
+
+
+def build_pair_snapshot(market_snapshot: Dict[str, object]) -> Dict[str, object]:
+    symbol_features = market_snapshot["symbols"]
+    available_symbols = [s for s in METALS_SYMBOLS if s in symbol_features]
+
+    if len(available_symbols) < 2:
+        raise ValueError("Need at least two metals symbols with valid data")
+
+    close_map = {}
+    for symbol in available_symbols:
+        frame = market_snapshot["frames"].get(symbol)
+        if frame is not None and not frame.empty:
+            close_map[symbol] = frame["Close"]
+
+    closes = pd.DataFrame(close_map).dropna(how="all")
+    if closes.shape[1] < 2:
+        raise ValueError("Not enough close history available to build pair analytics")
+
+    all_pairs: List[Dict[str, object]] = []
+    for symbol_a, symbol_b in itertools.combinations(closes.columns.tolist(), 2):
+        signal = calculate_pair_signal(symbol_a, symbol_b, closes, symbol_features)
+        if signal is not None:
+            all_pairs.append(signal)
+
+    all_pairs.sort(key=lambda x: x["score"], reverse=True)
+    candidates = [p for p in all_pairs if abs(p["current_zscore"]) >= MIN_ABS_ZSCORE][:MAX_CANDIDATES]
+
+    return {
+        "fetched_at": now_iso(),
+        "all_pairs": all_pairs,
+        "candidates": candidates,
+    }
+
+
+def build_trade_summary(candidates: List[Dict[str, object]]) -> str:
     if not candidates:
-        print("No candidates met the minimum z-score threshold.")
-        return
+        return (
+            "No metals relative-value candidate cleared the minimum correlation and z-score thresholds. "
+            "Current conditions do not justify a mean-reversion trade signal."
+        )
 
-    for idx, c in enumerate(candidates, start=1):
-        print(f"\n[{idx}] {c['recommendation']}")
-        print(f"    Pair:        {c['name_a']} vs {c['name_b']} ({c['symbol_a']} / {c['symbol_b']})")
-        print(f"    Correlation: {c['correlation']:.2f}")
-        print(f"    Beta:        {c['hedge_ratio_beta']:.4f}")
-        print(f"    Close Z:     {c['last_close_zscore']:.2f}")
-        print(f"    Current Z:   {c['current_zscore']:.2f}")
-        print(f"    Confidence:  {c['confidence']:.2f}")
-        print(f"    Score:       {c['score']:.2f}")
-        print(f"    Expensive:   {c['expensive_symbol']}")
-        print(f"    Cheap:       {c['cheap_symbol']}")
-        print(f"    Rationale:   {c['rationale']}")
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Standalone metals relative-value Trade Analyst")
-    parser.add_argument("--json-out", type=str, default=None, help="Optional path to save JSON report")
-    parser.add_argument("--min-corr", type=float, default=0.45, help="Minimum pair correlation threshold")
-    parser.add_argument("--min-abs-z", type=float, default=1.25, help="Minimum absolute current z-score")
-    parser.add_argument("--corr-window", type=int, default=126, help="Rolling window for return correlation")
-    parser.add_argument("--spread-window", type=int, default=126, help="Window for hedge ratio estimation")
-    parser.add_argument("--zscore-window", type=int, default=63, help="Window for spread z-score")
-    parser.add_argument(
-        "--disable-current-price",
-        action="store_true",
-        help="Use previous daily closes only",
-    )
-    return parser
-
-
-def main() -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args()
-
-    config = AnalystConfig(
-        min_corr=args.min_corr,
-        min_abs_z=args.min_abs_z,
-        corr_window=args.corr_window,
-        spread_window=args.spread_window,
-        zscore_window=args.zscore_window,
-        use_current_price=not args.disable_current_price,
+    top = candidates[0]
+    return (
+        f"Top metals RV opportunity is {top['recommendation']} in {top['pair_label']}. "
+        f"Current spread z-score is {top['current_zscore']:.2f} with {top['correlation']:.2f} correlation and confidence {top['confidence']:.2f}."
     )
 
-    analyst = MetalsTradeAnalyst(config)
+
+# -------------------- DECISION BUILDER --------------------
+def build_trade_decision() -> Dict[str, object]:
+    cached = load_cache()
+    cache_hit = bool(cached)
+
+    if cached:
+        market_snapshot = cached["market_snapshot"]
+        pair_snapshot = cached["pair_snapshot"]
+    else:
+        market_snapshot = fetch_market_snapshot()
+        pair_snapshot = build_pair_snapshot(market_snapshot)
+        save_cache({
+            "market_snapshot": market_snapshot,
+            "pair_snapshot": pair_snapshot,
+        })
+
+    candidates = pair_snapshot["candidates"]
+    top_candidate = candidates[0] if candidates else None
+
+    data_quality = {
+        "cache_hit": cache_hit,
+        "fetched_at_market": market_snapshot.get("fetched_at"),
+        "fetched_at_pairs": pair_snapshot.get("fetched_at"),
+        "missing_symbols": sorted(list(market_snapshot.get("errors", {}).keys())),
+        "available_symbols": sorted(list(market_snapshot.get("symbols", {}).keys())),
+        "price_sources": {
+            METALS_SYMBOLS[s]: market_snapshot["symbols"][s].get("price_source")
+            for s in market_snapshot.get("symbols", {})
+        },
+    }
+
+    return {
+        "agent": "trade_analyst",
+        "event_id": now_iso(),
+        "data_quality": data_quality,
+        "decision": {
+            "complex": "metals",
+            "strategy_family": "relative_value_mean_reversion",
+            "candidate_count": len(candidates),
+            "top_candidate": top_candidate,
+            "thresholds": {
+                "min_correlation": MIN_CORRELATION,
+                "min_abs_zscore": MIN_ABS_ZSCORE,
+                "corr_window_days": CORR_WINDOW,
+                "beta_window_days": BETA_WINDOW,
+                "zscore_window_days": ZSCORE_WINDOW,
+            },
+        },
+        "components": {
+            "metals": market_snapshot["symbols"],
+            "pair_analytics": {
+                pair["pair_label"]: pair
+                for pair in pair_snapshot["all_pairs"]
+            },
+            "trade_candidates": candidates,
+        },
+        "summary": build_trade_summary(candidates),
+    }
+
+
+# -------------------- OPTIONAL LLM SUMMARY --------------------
+def add_llm_summary(decision: Dict[str, object]) -> Dict[str, object]:
+    llm = ChatOllama(
+        model=OLLAMA_MODEL,
+        base_url=OLLAMA_BASE_URL,
+        temperature=0.2,
+    )
+
+    prompt_payload = {
+        "decision": decision["decision"],
+        "summary": decision["summary"],
+    }
+
+    prompt = (
+        "You are a concise trade analyst narrator. "
+        "Return ONLY valid JSON with one key named summary. "
+        "Keep it to 2 sentences max and do not change the deterministic view.\n\n"
+        f"{json.dumps(prompt_payload, indent=2)}\n\n"
+        'Output format: {"summary": "..."}'
+    )
 
     try:
-        daily_closes = analyst.fetch_daily_closes()
-        snapshots = analyst.fetch_price_snapshots(daily_closes)
-        report = analyst.analyze(daily_closes, snapshots)
+        response = llm.invoke(prompt)
+        parsed = json.loads(response.content)
+        if isinstance(parsed, dict) and "summary" in parsed:
+            decision["summary"] = parsed["summary"]
+    except Exception:
+        pass
 
-        print_human_summary(report)
-
-        if args.json_out:
-            with open(args.json_out, "w", encoding="utf-8") as f:
-                json.dump(report, f, indent=2)
-            print(f"\nSaved JSON report to: {args.json_out}")
-
-        return 0
-
-    except KeyboardInterrupt:
-        print("\nInterrupted by user.", file=sys.stderr)
-        return 130
-    except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
-        return 1
+    return decision
 
 
+# -------------------- MAIN --------------------
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        decision = build_trade_decision()
+
+        if USE_LLM_SUMMARY:
+            decision = add_llm_summary(decision)
+
+        print(json.dumps(decision, indent=2))
+
+        report_path = REPORTS_DIR / f"trade_report_metals_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(decision, f, indent=2)
+
+        print(f"\n[INFO] Report written to {report_path}")
+
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
+        sys.exit(1)
