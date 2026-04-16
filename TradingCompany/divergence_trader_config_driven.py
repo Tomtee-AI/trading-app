@@ -862,6 +862,42 @@ def rank_proxy_candidates(
     return rows
 
 
+def describe_leg_trade(leg: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not leg or leg.get("status") != "CANDIDATE":
+        return None
+
+    side = str(leg.get("side", "")).upper()
+    symbol = leg.get("symbol")
+    options_template = leg.get("options_template") or {}
+    preferred_structure = options_template.get("preferred_structure")
+
+    if leg.get("options_available") and preferred_structure:
+        structure_label_map = {
+            "PUT_DEBIT_SPREAD": "put debit spread",
+            "CALL_DEBIT_SPREAD": "call debit spread",
+        }
+        structure_label = structure_label_map.get(preferred_structure, preferred_structure.replace("_", " ").lower())
+        action = "Short" if side == "SHORT" else "Long"
+        return f"{action} {symbol} via {structure_label}"
+
+    fallback_action = "SELL" if side == "SHORT" else "BUY"
+    return f"{fallback_action} {symbol} stock"
+
+
+def build_proxy_first_candidate_summary(
+    pair_candidate: Dict[str, Any],
+    short_leg: Optional[Dict[str, Any]],
+    long_leg: Optional[Dict[str, Any]],
+) -> str:
+    leg_descriptions = [desc for desc in [describe_leg_trade(short_leg), describe_leg_trade(long_leg)] if desc]
+    proxy_trade = " / ".join(leg_descriptions) if leg_descriptions else "No proxy trade available"
+    return (
+        f"Proxy/options trade: {proxy_trade}. "
+        f"Signal source: {pair_candidate['pair_label']} futures divergence "
+        f"(z-score {pair_candidate['current_zscore']:.2f}, correlation {pair_candidate['correlation']:.2f})."
+    )
+
+
 def build_candidate_payload(
     pair_candidate: Dict[str, Any],
     parsed_config: Dict[str, Any],
@@ -903,7 +939,19 @@ def build_candidate_payload(
     if (short_leg and not short_leg.get("options_available")) or (long_leg and not long_leg.get("options_available")):
         structure_family = "PAIR_TRADE_STOCK_PLUS_OPTION_OVERLAY"
 
+    primary_proxy_trade = build_proxy_first_candidate_summary(pair_candidate, short_leg, long_leg)
+
     implementation = {
+        "signal_source": {
+            "pair_id": pair_candidate["pair_id"],
+            "pair_label": pair_candidate["pair_label"],
+            "category": pair_candidate["category"],
+            "correlation": pair_candidate["correlation"],
+            "hedge_ratio_beta": pair_candidate["hedge_ratio_beta"],
+            "current_zscore": pair_candidate["current_zscore"],
+            "expensive_alias": expensive_alias,
+            "cheap_alias": cheap_alias,
+        },
         "pair_metrics": {
             "pair_id": pair_candidate["pair_id"],
             "pair_label": pair_candidate["pair_label"],
@@ -922,6 +970,7 @@ def build_candidate_payload(
             "short_leg_candidates": short_ranked[:5],
             "long_leg_candidates": long_ranked[:5],
         },
+        "primary_recommendation": primary_proxy_trade,
         "trade_templates": {
             "short_leg_stock_action": (
                 f"SELL {short_leg['symbol']}" if short_leg and short_leg.get("status") == "CANDIDATE" else None
@@ -938,10 +987,7 @@ def build_candidate_payload(
         },
     }
 
-    summary = (
-        f"Divergence candidate {pair_candidate['pair_label']}: short {expensive_alias} proxies and long {cheap_alias} proxies. "
-        f"Spread z-score {pair_candidate['current_zscore']:.2f}, correlation {pair_candidate['correlation']:.2f}."
-    )
+    summary = primary_proxy_trade
 
     return {
         "candidate_id": f"div_{pair_candidate['pair_label'].replace('/', '_').lower()}",
@@ -984,6 +1030,10 @@ def build_candidates(
 def build_summary(candidates: List[Dict[str, Any]], pair_snapshot: Dict[str, Any]) -> str:
     if candidates:
         top = candidates[0]
+        top_summary = top.get("summary")
+        if top_summary:
+            return f"Top divergence candidate: {top_summary}"
+
         pair_metrics = top["implementation"]["pair_metrics"]
         return (
             f"Top divergence candidate is {pair_metrics['pair_label']} with z-score {pair_metrics['current_zscore']:.2f} "
