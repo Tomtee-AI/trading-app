@@ -26,7 +26,7 @@ import pickle
 import sys
 import time
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -39,9 +39,17 @@ try:
 except Exception:
     pass
 
+# Resolve the script directory before loading .env so the FRED_API_KEY is found
+# whether the script is launched from its own folder, a project root, or a scheduler.
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 try:
     from dotenv import load_dotenv
-    load_dotenv()
+
+    # First load a .env next to this script, then allow python-dotenv to search
+    # the current working directory/parents. Existing environment variables win.
+    load_dotenv(SCRIPT_DIR / ".env", override=False)
+    load_dotenv(override=False)
 except Exception:
     pass
 
@@ -62,6 +70,9 @@ CACHE_TTL_SECONDS = 300
 
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 USE_MACRO = bool(FRED_API_KEY)
+FRED_TIMEOUT_SECONDS = 20
+FRED_MAX_RETRIES = 3
+FRED_USER_AGENT = "ZeroHumanCompany-market-analyst/2.x"
 USE_FUTURES_CONTEXT = True
 FUTURES_SYMBOL = "NQ=F"
 
@@ -115,7 +126,8 @@ class RuntimeConfig:
 
 # -------------------- HELPERS --------------------
 def now_iso() -> str:
-    return datetime.now().isoformat()
+    """UTC timestamp for deterministic cross-agent event IDs."""
+    return datetime.now(timezone.utc).isoformat()
 
 
 def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
@@ -125,6 +137,19 @@ def safe_float(value: Any, default: Optional[float] = None) -> Optional[float]:
         return float(value)
     except Exception:
         return default
+
+
+def redact_secret(value: Any) -> str:
+    """Return an error string with API keys removed before JSON/report output.
+
+    requests.HTTPError messages often include the full URL, including query-string
+    API keys. Agent diagnostics should be useful, but they should never leak
+    secrets into stdout, report files, databases, or downstream prompts.
+    """
+    text = str(value)
+    if FRED_API_KEY:
+        text = text.replace(FRED_API_KEY, "<redacted>")
+    return text
 
 
 def clamp(value: float, low: float, high: float) -> float:
@@ -185,8 +210,8 @@ def latest_two_weeks(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     return current_df, prev_df
 
 
-def load_cache() -> Optional[Dict[str, Any]]:
-    if CACHE_FILE.exists() and time.time() - CACHE_FILE.stat().st_mtime < CACHE_TTL_SECONDS:
+def load_cache(ttl_seconds: int = CACHE_TTL_SECONDS) -> Optional[Dict[str, Any]]:
+    if CACHE_FILE.exists() and time.time() - CACHE_FILE.stat().st_mtime < ttl_seconds:
         try:
             with open(CACHE_FILE, "rb") as f:
                 return pickle.load(f)
@@ -205,6 +230,20 @@ def save_cache(payload: Dict[str, Any]) -> None:
 
 # -------------------- DATA FETCH --------------------
 def fred_series_observations(series_id: str, limit: int = 30) -> List[Dict[str, float]]:
+    """Fetch recent observations for one FRED series.
+
+    Request correctness check:
+      - Endpoint: https://api.stlouisfed.org/fred/series/observations
+      - Required params: series_id, api_key
+      - JSON output requested with file_type=json
+      - Newest observations requested with sort_order=desc and a small limit
+
+    Operational guardrails:
+      - Retry transient 5xx/server/network failures.
+      - Do not retry 4xx errors because those usually mean invalid key, invalid
+        series_id, or another caller-side issue.
+      - Redact API keys before surfacing errors downstream.
+    """
     if not FRED_API_KEY:
         return []
 
@@ -216,18 +255,48 @@ def fred_series_observations(series_id: str, limit: int = 30) -> List[Dict[str, 
         "sort_order": "desc",
         "limit": limit,
     }
+    headers = {"User-Agent": FRED_USER_AGENT}
 
-    r = requests.get(url, params=params, timeout=20)
-    r.raise_for_status()
+    last_error: Optional[BaseException] = None
+    for attempt in range(1, FRED_MAX_RETRIES + 1):
+        try:
+            response = requests.get(url, params=params, headers=headers, timeout=FRED_TIMEOUT_SECONDS)
 
-    observations: List[Dict[str, float]] = []
-    for row in r.json().get("observations", []):
-        value = row.get("value")
-        if value == ".":
-            continue
-        observations.append({"date": row.get("date"), "value": float(value)})
-    return observations
+            # FRED can occasionally return a transient 500. Retrying the specific
+            # series is safer than failing the whole macro snapshot.
+            if response.status_code >= 500 and attempt < FRED_MAX_RETRIES:
+                time.sleep(0.75 * attempt)
+                continue
 
+            # For 4xx errors, raise immediately. Retrying will not fix an invalid
+            # API key, malformed parameter, or invalid series id.
+            response.raise_for_status()
+            payload = response.json()
+
+            observations: List[Dict[str, float]] = []
+            for row in payload.get("observations", []):
+                value = row.get("value")
+                if value in {None, "."}:
+                    continue
+                try:
+                    observations.append({"date": row.get("date"), "value": float(value)})
+                except (TypeError, ValueError):
+                    continue
+            return observations
+
+        except requests.HTTPError:
+            # 4xx should not be retried. 5xx has already had retry chances.
+            raise
+        except requests.RequestException as exc:
+            last_error = exc
+            if attempt < FRED_MAX_RETRIES:
+                time.sleep(0.75 * attempt)
+                continue
+            raise RuntimeError(f"FRED request failed after {FRED_MAX_RETRIES} attempts: {redact_secret(exc)}") from exc
+
+    if last_error is not None:
+        raise RuntimeError(f"FRED request failed: {redact_secret(last_error)}") from last_error
+    return []
 
 def fetch_history(symbol: str, period: str = "2y", interval: str = "1d") -> pd.DataFrame:
     df = yf.Ticker(symbol).history(period=period, interval=interval, auto_adjust=False)
@@ -331,25 +400,52 @@ def fetch_market_snapshot() -> Dict[str, object]:
 
 
 def fetch_macro_snapshot() -> Dict[str, object]:
+    """Fetch macro inputs without letting one bad FRED series kill the whole block.
+
+    The original implementation wrapped all FRED requests in one try/except. That
+    meant a transient 500 on DGS2, DGS5, DEXJPUS, or RRPONTSYD caused the entire
+    macro snapshot to become ERROR and erased all usable macro context.
+
+    This version fetches each series independently:
+      - status = OK      when every requested series loads
+      - status = PARTIAL when at least one series loads but one or more fail
+      - status = ERROR   when all requested series fail
+
+    Scoring functions treat unavailable fields as neutral, so PARTIAL macro data
+    is safer than discarding every macro input.
+    """
     if not USE_MACRO:
         return {
             "fetched_at": now_iso(),
             "status": "UNAVAILABLE",
+            "series_errors": {},
             "rates": {},
             "fx": {},
             "liquidity": {},
         }
 
-    try:
-        dgs2 = fred_series_observations(FRED_SERIES["DGS2"], limit=10)
-        dgs5 = fred_series_observations(FRED_SERIES["DGS5"], limit=10)
-        dexjpus = fred_series_observations(FRED_SERIES["DEXJPUS"], limit=10)
-        rrp = fred_series_observations(FRED_SERIES["RRPONTSYD"], limit=25)
-    except Exception as exc:
+    fetched: Dict[str, List[Dict[str, float]]] = {}
+    series_errors: Dict[str, str] = {}
+
+    for key, series_id in FRED_SERIES.items():
+        try:
+            fetched[key] = fred_series_observations(series_id, limit=25 if key == "RRPONTSYD" else 10)
+        except Exception as exc:
+            fetched[key] = []
+            series_errors[key] = redact_secret(exc)
+
+    dgs2 = fetched.get("DGS2", [])
+    dgs5 = fetched.get("DGS5", [])
+    dexjpus = fetched.get("DEXJPUS", [])
+    rrp = fetched.get("RRPONTSYD", [])
+
+    loaded_series = [key for key, rows in fetched.items() if rows]
+    if not loaded_series:
         return {
             "fetched_at": now_iso(),
             "status": "ERROR",
-            "error": str(exc),
+            "error": "All FRED macro series failed or returned no usable observations.",
+            "series_errors": series_errors,
             "rates": {},
             "fx": {},
             "liquidity": {},
@@ -377,12 +473,16 @@ def fetch_macro_snapshot() -> Dict[str, object]:
 
     return {
         "fetched_at": now_iso(),
-        "status": "OK",
+        "status": "PARTIAL" if series_errors else "OK",
+        "loaded_series": loaded_series,
+        "series_errors": series_errors,
         "rates": {
+            "status": "OK" if dgs2 and dgs5 else "UNAVAILABLE",
             "spread_2y_5y_bps": spread_2y_5y_bps,
             "change_5d_bps": change_5d_bps,
         },
         "fx": {
+            "status": "OK" if dexjpus else "UNAVAILABLE",
             "series": "DEXJPUS",
             "description": "Japanese Yen to 1 U.S. Dollar",
             "yen_per_usd": latest_fx,
@@ -390,13 +490,13 @@ def fetch_macro_snapshot() -> Dict[str, object]:
             "change_5d_pct": fx_5d_change,
         },
         "liquidity": {
+            "status": "OK" if rrp else "UNAVAILABLE",
             "series": "RRPONTSYD",
             "rrp_balance_bil": latest_rrp,
             "change_5d_bil": round(latest_rrp - rrp_5d_old, 2) if latest_rrp is not None and rrp_5d_old is not None else None,
             "change_20d_bil": round(latest_rrp - rrp_20d_old, 2) if latest_rrp is not None and rrp_20d_old is not None else None,
         },
     }
-
 
 # -------------------- SCORING --------------------
 def generic_price_structure_score(features: Dict[str, object], include_long_window: bool = False) -> Tuple[int, Dict[str, object]]:
@@ -518,7 +618,7 @@ def score_futures_context(features: Optional[Dict[str, object]], long_term: bool
 
 
 def score_macro_short(macro: Dict[str, object]) -> Tuple[int, Dict[str, str]]:
-    if macro.get("status") != "OK":
+    if macro.get("status") not in {"OK", "PARTIAL"}:
         return 0, {"status": macro.get("status", "UNAVAILABLE")}
 
     rates = macro["rates"]
@@ -555,7 +655,7 @@ def score_macro_short(macro: Dict[str, object]) -> Tuple[int, Dict[str, str]]:
 
 
 def score_macro_long(macro: Dict[str, object]) -> Tuple[int, Dict[str, str]]:
-    if macro.get("status") != "OK":
+    if macro.get("status") not in {"OK", "PARTIAL"}:
         return 0, {"status": macro.get("status", "UNAVAILABLE")}
 
     rates = macro["rates"]
@@ -895,7 +995,7 @@ def build_horizon_block(
 # -------------------- DECISION BUILDER --------------------
 def build_market_decision(config: Optional[RuntimeConfig] = None) -> Dict[str, object]:
     config = config or RuntimeConfig()
-    cached = load_cache()
+    cached = load_cache(config.cache_ttl_seconds)
     cache_hit = bool(cached)
 
     if cached:
@@ -991,7 +1091,7 @@ if __name__ == "__main__":
         with open(report_path, "w", encoding="utf-8") as f:
             json.dump(decision, f, indent=2)
 
-        print(f"\n[INFO] Report written to {report_path}")
+        print(f"\n[INFO] Report written to {report_path}", file=sys.stderr)
     except Exception as exc:
-        print(f"[ERROR] {exc}")
+        print(f"[ERROR] {exc}", file=sys.stderr)
         sys.exit(1)

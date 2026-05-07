@@ -43,6 +43,8 @@ import pandas as pd
 import yfinance as yf
 from jsonschema import Draft202012Validator, FormatChecker
 
+from option_liquidity import OptionLiquidityConfig, select_vertical_debit_spread
+
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -102,9 +104,10 @@ OUTPUT_SCHEMA = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
     "additionalProperties": False,
-    "required": ["agent", "event_id", "strategy_type", "candidates", "summary"],
+    "required": ["agent", "schema_version", "event_id", "strategy_type", "candidates", "summary"],
     "properties": {
         "agent": {"type": "string", "const": "divergence_analyst"},
+        "schema_version": {"type": "string", "const": "2.2.0"},
         "event_id": {"type": "string", "format": "date-time"},
         "strategy_type": {"type": "string", "const": "divergence"},
         "candidates": {"type": "array", "items": COORDINATOR_CANDIDATE_SCHEMA},
@@ -176,6 +179,14 @@ class RuntimeConfig:
     iv_premium: float = 1.10
     require_vol_up_for_sigma: bool = False
     pair_allowlist_text: Optional[str] = None
+    min_underlying_price: float = 5.0
+    max_underlying_price: float = 100.0
+    min_option_open_interest: int = 20
+    min_option_volume: int = 1
+    max_bid_ask_spread_pct: float = 0.35
+    min_trade_debit: float = 0.50
+    max_trade_debit: float = 5.00
+    vertical_target_otm_pct: float = 0.08
 
 
 def now_iso() -> str:
@@ -812,6 +823,15 @@ def analyze_proxy_symbol(
         }
 
     effective_price = feature.get("effective_price")
+    if effective_price is None or effective_price < runtime.min_underlying_price or effective_price > runtime.max_underlying_price:
+        return {
+            "alias": alias,
+            "symbol": symbol,
+            "status": "DISQUALIFIED",
+            "reason": "UNDERLYING_PRICE_OUTSIDE_RULE_RANGE",
+            "effective_price": effective_price,
+            "composite_score": -999.0,
+        }
     sma_63 = feature.get("sma_63")
     deviation_pct = None
     directional_dev_pct = None
@@ -849,6 +869,43 @@ def analyze_proxy_symbol(
         runtime.option_target_max_dte,
     )
 
+    liquidity_config = OptionLiquidityConfig(
+        min_open_interest=runtime.min_option_open_interest,
+        min_volume=runtime.min_option_volume,
+        max_bid_ask_spread_pct=runtime.max_bid_ask_spread_pct,
+        min_trade_debit=runtime.min_trade_debit,
+        max_trade_debit=runtime.max_trade_debit,
+        min_dte=runtime.option_target_min_dte,
+        max_dte=runtime.option_target_max_dte,
+        target_otm_pct=runtime.vertical_target_otm_pct,
+    )
+    option_side = "BULLISH" if side == "LONG" else "BEARISH"
+    option_spread_check = select_vertical_debit_spread(
+        symbol=symbol,
+        side=option_side,
+        underlying_price=float(effective_price),
+        config=liquidity_config,
+        expiration=selected_expiration,
+    ) if options_available else {
+        "status": "FAILED_LIQUIDITY",
+        "reason": "no_listed_options",
+        "symbol": symbol,
+    }
+
+    if option_spread_check.get("status") != "OK":
+        return {
+            "alias": alias,
+            "symbol": symbol,
+            "status": "DISQUALIFIED",
+            "reason": "OPTION_LIQUIDITY_FAILED",
+            "side": side,
+            "effective_price": effective_price,
+            "options_available": options_available,
+            "selected_expiration": selected_expiration,
+            "option_spread_check": option_spread_check,
+            "composite_score": -999.0,
+        }
+
     deviation_component = 0.0
     if directional_dev_pct is not None:
         deviation_component = clamp(directional_dev_pct / 6.0, -1.0, 1.0)
@@ -874,6 +931,8 @@ def analyze_proxy_symbol(
         "options_available": options_available,
         "selected_expiration": selected_expiration,
         "options_template": build_proxy_option_template(side, runtime),
+        "option_spread_check": option_spread_check,
+        "exact_trade": option_spread_check,
         "options_analysis_packet": packet,
     }
 
@@ -895,6 +954,12 @@ def rank_proxy_candidates(
 
 
 def describe_leg_trade(leg: Optional[Dict[str, Any]]) -> Optional[str]:
+    """Describe a proxy leg without implying naked short stock or undefined risk.
+
+    The rules file permits long-premium/defined-risk options structures and
+    explicitly avoids naked shorts and non-premium-limited trades. A bearish
+    leg is therefore described as a put debit spread, not as short stock.
+    """
     if not leg or leg.get("status") != "CANDIDATE":
         return None
 
@@ -903,17 +968,16 @@ def describe_leg_trade(leg: Optional[Dict[str, Any]]) -> Optional[str]:
     options_template = leg.get("options_template") or {}
     preferred_structure = options_template.get("preferred_structure")
 
-    if leg.get("options_available") and preferred_structure:
-        structure_label_map = {
-            "PUT_DEBIT_SPREAD": "put debit spread",
-            "CALL_DEBIT_SPREAD": "call debit spread",
-        }
-        structure_label = structure_label_map.get(preferred_structure, preferred_structure.replace("_", " ").lower())
-        action = "Short" if side == "SHORT" else "Long"
-        return f"{action} {symbol} via {structure_label}"
+    if not leg.get("options_available") or not preferred_structure:
+        return None
 
-    fallback_action = "SELL" if side == "SHORT" else "BUY"
-    return f"{fallback_action} {symbol} stock"
+    structure_label_map = {
+        "PUT_DEBIT_SPREAD": "put debit spread",
+        "CALL_DEBIT_SPREAD": "call debit spread",
+    }
+    structure_label = structure_label_map.get(preferred_structure, preferred_structure.replace("_", " ").lower())
+    action = "Bearish" if side == "SHORT" else "Bullish"
+    return f"{action} {symbol} via {structure_label}"
 
 
 def build_proxy_first_candidate_summary(
@@ -945,10 +1009,21 @@ def build_candidate_payload(
 
     short_leg = short_ranked[0] if short_ranked else None
     long_leg = long_ranked[0] if long_ranked else None
-    if not short_leg and not long_leg:
+    # Fail closed: the rules require downside limited to premium paid.
+    # A relative-value candidate is only emitted when both proxy legs can be
+    # expressed as defined-risk option structures.
+    if not short_leg or not long_leg:
+        return None
+    if short_leg.get("status") != "CANDIDATE" or long_leg.get("status") != "CANDIDATE":
+        return None
+    if not short_leg.get("options_available") or not long_leg.get("options_available"):
+        return None
+    if short_leg.get("option_spread_check", {}).get("status") != "OK":
+        return None
+    if long_leg.get("option_spread_check", {}).get("status") != "OK":
         return None
 
-    risk_flags: List[str] = ["relative_value", "defined_risk_preferred", "synthetic_iv_fallback"]
+    risk_flags: List[str] = ["relative_value", "defined_risk_preferred", "synthetic_iv_fallback", "option_liquidity_verified"]
     if short_leg and not short_leg.get("options_available"):
         risk_flags.append(f"no_listed_options_{short_leg['symbol']}")
     if long_leg and not long_leg.get("options_available"):
@@ -968,8 +1043,6 @@ def build_candidate_payload(
         return None
 
     structure_family = "PAIR_TRADE_WITH_DEFINED_RISK_OPTIONS"
-    if (short_leg and not short_leg.get("options_available")) or (long_leg and not long_leg.get("options_available")):
-        structure_family = "PAIR_TRADE_STOCK_PLUS_OPTION_OVERLAY"
 
     primary_proxy_trade = build_proxy_first_candidate_summary(pair_candidate, short_leg, long_leg)
 
@@ -1004,17 +1077,17 @@ def build_candidate_payload(
         },
         "primary_recommendation": primary_proxy_trade,
         "trade_templates": {
-            "short_leg_stock_action": (
-                f"SELL {short_leg['symbol']}" if short_leg and short_leg.get("status") == "CANDIDATE" else None
-            ),
-            "long_leg_stock_action": (
-                f"BUY {long_leg['symbol']}" if long_leg and long_leg.get("status") == "CANDIDATE" else None
-            ),
+            "short_leg_stock_action": None,
+            "long_leg_stock_action": None,
             "short_leg_options": short_leg.get("options_template") if short_leg else None,
             "long_leg_options": long_leg.get("options_template") if long_leg else None,
+            "short_leg_exact_spread": short_leg.get("option_spread_check") if short_leg else None,
+            "long_leg_exact_spread": long_leg.get("option_spread_check") if long_leg else None,
         },
         "hard_limits": {
             "undefined_risk_allowed": False,
+            "short_naked_options_allowed": False,
+            "stock_short_allowed": False,
             "direct_order_routing_allowed": False,
         },
     }
@@ -1113,6 +1186,7 @@ def build_output(runtime: RuntimeConfig) -> Tuple[Dict[str, Any], Dict[str, Any]
 
     output = {
         "agent": "divergence_analyst",
+        "schema_version": "2.2.0",
         "event_id": now_iso(),
         "strategy_type": "divergence",
         "candidates": candidates,
@@ -1159,6 +1233,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--option-max-dte", type=int, default=60)
     parser.add_argument("--iv-premium", type=float, default=1.10, help="Multiplier applied to 20d realized vol to synthesize IV series")
     parser.add_argument("--require-vol-up-for-sigma", action="store_true")
+    parser.add_argument("--min-underlying-price", type=float, default=5.0)
+    parser.add_argument("--max-underlying-price", type=float, default=100.0)
+    parser.add_argument("--min-option-open-interest", type=int, default=20)
+    parser.add_argument("--min-option-volume", type=int, default=1)
+    parser.add_argument("--max-bid-ask-spread-pct", type=float, default=0.35)
+    parser.add_argument("--min-trade-debit", type=float, default=0.50)
+    parser.add_argument("--max-trade-debit", type=float, default=5.00)
+    parser.add_argument("--vertical-target-otm-pct", type=float, default=0.08)
     return parser
 
 
@@ -1179,6 +1261,14 @@ def main() -> int:
         iv_premium=args.iv_premium,
         require_vol_up_for_sigma=args.require_vol_up_for_sigma,
         pair_allowlist_text=args.pairs,
+        min_underlying_price=args.min_underlying_price,
+        max_underlying_price=args.max_underlying_price,
+        min_option_open_interest=args.min_option_open_interest,
+        min_option_volume=args.min_option_volume,
+        max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        min_trade_debit=args.min_trade_debit,
+        max_trade_debit=args.max_trade_debit,
+        vertical_target_otm_pct=args.vertical_target_otm_pct,
     )
 
     output, internal_report = build_output(runtime)
@@ -1193,8 +1283,8 @@ def main() -> int:
     with open(diagnostics_path, "w", encoding="utf-8") as f:
         json.dump(internal_report, f, indent=2)
 
-    print(f"\n[INFO] Coordinator payload written to {payload_path}")
-    print(f"[INFO] Diagnostics written to {diagnostics_path}")
+    print(f"\n[INFO] Coordinator payload written to {payload_path}", file=sys.stderr)
+    print(f"[INFO] Diagnostics written to {diagnostics_path}", file=sys.stderr)
     return 0
 
 
@@ -1202,5 +1292,5 @@ if __name__ == "__main__":
     try:
         raise SystemExit(main())
     except Exception as exc:
-        print(f"[ERROR] {exc}")
+        print(f"[ERROR] {exc}", file=sys.stderr)
         raise SystemExit(1)

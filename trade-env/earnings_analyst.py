@@ -70,9 +70,14 @@ import re
 import sys
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, time as dt_time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - fallback for very old Python runtimes
+    ZoneInfo = None  # type: ignore
 
 import numpy as np
 import pandas as pd
@@ -184,10 +189,110 @@ class RuntimeConfig:
     strict_date_validation: bool = False
     date_validation_tolerance_days: int = 2
     request_timeout: int = 12
+    market_timezone: str = "America/New_York"
+    market_open_time: str = "09:30"
+    market_close_time: str = "16:00"
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_clock_time(value: str, default: dt_time) -> dt_time:
+    """Parse a HH:MM clock-time string safely.
+
+    The earnings analyst uses this for coarse event-staleness checks.  The
+    function intentionally falls back to a conservative default instead of
+    raising, because bad CLI/config values should not crash the full agent.
+    """
+    try:
+        hour_text, minute_text = str(value).strip().split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text)
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return dt_time(hour=hour, minute=minute)
+    except Exception:
+        pass
+    return default
+
+
+def get_market_timezone(config: RuntimeConfig):
+    """Return the configured market timezone, falling back safely to UTC."""
+    if ZoneInfo is None:
+        return timezone.utc
+    try:
+        return ZoneInfo(config.market_timezone)
+    except Exception:
+        return timezone.utc
+
+
+def assess_earnings_event_timing(
+    earnings_date: date,
+    earnings_time: Any,
+    config: RuntimeConfig,
+    as_of_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Determine whether a listed earnings event is still tradable.
+
+    Rule enforced here:
+        Same-day BEFORE_OPEN earnings events must not be promoted after the
+        regular cash session has opened.  Once the stock has already reported
+        before the open, a new long-premium earnings-volatility entry is stale;
+        the event catalyst has passed and implied volatility may already have
+        collapsed.
+
+    This function is intentionally conservative and deterministic.  It does
+    not try to infer exact press-release times.  It uses the configured market
+    timezone and regular session open as a practical cutoff.
+    """
+    tz = get_market_timezone(config)
+    now_market = (as_of_utc or datetime.now(timezone.utc)).astimezone(tz)
+    earnings_time_text = str(earnings_time or "UNKNOWN").upper()
+    market_open = parse_clock_time(config.market_open_time, dt_time(9, 30))
+    market_close = parse_clock_time(config.market_close_time, dt_time(16, 0))
+    market_open_dt = datetime.combine(earnings_date, market_open, tzinfo=tz)
+    market_close_dt = datetime.combine(earnings_date, market_close, tzinfo=tz)
+
+    result = {
+        "status": "PENDING",
+        "eligible_for_new_entry": True,
+        "reason": "event_not_yet_past",
+        "market_timezone": getattr(tz, "key", str(tz)),
+        "as_of_market_time": now_market.isoformat(),
+        "market_open_cutoff": market_open_dt.isoformat(),
+        "market_close_reference": market_close_dt.isoformat(),
+    }
+
+    # Previous-day events are stale regardless of the reported time bucket.
+    if earnings_date < now_market.date():
+        result.update({
+            "status": "PASSED",
+            "eligible_for_new_entry": False,
+            "reason": "earnings_date_before_market_today",
+        })
+        return result
+
+    # Future-dated events are still tradable from a timing perspective.
+    if earnings_date > now_market.date():
+        return result
+
+    # Same-day before-open events are stale once the regular session opens.
+    if earnings_time_text == "BEFORE_OPEN" and now_market >= market_open_dt:
+        result.update({
+            "status": "PASSED",
+            "eligible_for_new_entry": False,
+            "reason": "same_day_before_open_event_after_market_open",
+        })
+        return result
+
+    # Same-day after-close and unknown events remain eligible here.  Other
+    # validation layers still handle liquidity, cheap-vol, and date confidence.
+    if earnings_time_text == "AFTER_CLOSE":
+        result.update({"reason": "same_day_after_close_event_not_blocked_by_before_open_rule"})
+    elif earnings_time_text == "UNKNOWN":
+        result.update({"reason": "same_day_unknown_earnings_time_not_blocked"})
+
+    return result
 
 
 def as_jsonable(value: Any) -> Any:
@@ -985,12 +1090,26 @@ def analyze_symbol(record: Dict[str, Any], config: RuntimeConfig, options_module
     today = datetime.now(timezone.utc).date()
     days_to_earnings = (earnings_date - today).days
 
+    event_timing = assess_earnings_event_timing(earnings_date, record.get("earnings_time"), config)
+
     base = {
         "symbol": symbol,
         "earnings_date": earnings_date.isoformat(),
         "earnings_time": record.get("earnings_time"),
         "days_to_earnings": days_to_earnings,
+        "event_timing": event_timing,
     }
+
+    if not event_timing.get("eligible_for_new_entry", True):
+        return {
+            **base,
+            "status": "DISQUALIFIED",
+            "reason_code": "EARNINGS_EVENT_ALREADY_PASSED",
+            "summary": (
+                f"{symbol} earnings event is stale for new entry: "
+                f"{event_timing.get('reason')}"
+            ),
+        }
 
     if days_to_earnings < config.min_days_to_earnings or days_to_earnings > config.max_days_to_earnings:
         return {
@@ -1110,6 +1229,7 @@ def build_candidate(result: Dict[str, Any]) -> Dict[str, Any]:
             "earnings_date": result["earnings_date"],
             "earnings_time": result.get("earnings_time"),
             "days_to_earnings": result.get("days_to_earnings"),
+            "event_timing": result.get("event_timing"),
             "vol_value": vol_value,
             "date_validation_status": result.get("date_validation", {}).get("status"),
             "monthly_opex_cycle": result.get("monthly_opex_cycle"),
@@ -1176,6 +1296,9 @@ def build_output(config: RuntimeConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]
             "watchlist_min_fit_score": config.watchlist_min_fit_score,
             "strict_date_validation": config.strict_date_validation,
             "date_validation_tolerance_days": config.date_validation_tolerance_days,
+            "market_timezone": config.market_timezone,
+            "market_open_time": config.market_open_time,
+            "market_close_time": config.market_close_time,
         },
         "counts": {
             "input_symbols": len(records),
@@ -1207,6 +1330,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-watchlist", type=int, default=25)
     parser.add_argument("--strict-date-validation", action="store_true")
     parser.add_argument("--date-validation-tolerance-days", type=int, default=2)
+    parser.add_argument("--market-timezone", default="America/New_York", help="Timezone used for same-day earnings staleness checks")
+    parser.add_argument("--market-open-time", default="09:30", help="Regular session open cutoff for BEFORE_OPEN earnings, HH:MM")
+    parser.add_argument("--market-close-time", default="16:00", help="Regular session close reference for AFTER_CLOSE earnings, HH:MM")
     return parser
 
 
@@ -1228,6 +1354,9 @@ def main() -> int:
         max_watchlist=args.max_watchlist,
         strict_date_validation=args.strict_date_validation,
         date_validation_tolerance_days=args.date_validation_tolerance_days,
+        market_timezone=args.market_timezone,
+        market_open_time=args.market_open_time,
+        market_close_time=args.market_close_time,
     )
 
     output, diagnostics = build_output(config)

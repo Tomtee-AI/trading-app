@@ -21,6 +21,9 @@ def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
 
     The DataFrame index must be a DatetimeIndex.
     """
+    if df is None or df.empty:
+        raise ValueError("Input OHLC DataFrame is empty.")
+
     out = df.copy()
     rename = {}
     for col in out.columns:
@@ -37,7 +40,14 @@ def _normalize_ohlc(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(out.index, pd.DatetimeIndex):
         raise ValueError("DataFrame index must be a DatetimeIndex.")
 
-    return out.sort_index()
+    out = out.sort_index()
+    if out.index.has_duplicates:
+        out = out[~out.index.duplicated(keep="last")]
+    for col in required:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    if out[list(required)].dropna(how="all").empty:
+        raise ValueError("OHLC DataFrame contains no usable numeric high/low/close data.")
+    return out
 
 
 def _infer_bars_per_year(index: pd.DatetimeIndex, basis: PriceBasis = "annual") -> float:
@@ -84,7 +94,9 @@ def compute_historical_volatility(
       HV = stdev(log(close / close[1]), length)
            * sqrt(barsPerYear / basisCoeff * length / (length - 1))
     """
-    close = close.astype(float)
+    if length < 2:
+        raise ValueError("length must be at least 2 for historical volatility.")
+    close = pd.to_numeric(close, errors="coerce").astype(float)
     log_ret = np.log(close / close.shift(1))
     annualization = _infer_bars_per_year(close.index, basis=basis)
     hv = log_ret.rolling(length).std(ddof=1) * np.sqrt(annualization * length / max(length - 1, 1))
@@ -113,8 +125,10 @@ def compute_hviv_filter(
       IV_HIGHER = max(IV, iv[1..5]) > ((iv + iv[3]) / 2)
       vol_up = highest(IV_HIGHER, 3) and highest(HV_HIGHER, 3)
     """
-    close = close.astype(float)
-    iv = implied_volatility.astype(float)
+    if hv_length < 2:
+        raise ValueError("hv_length must be at least 2.")
+    close = pd.to_numeric(close, errors="coerce").astype(float)
+    iv = pd.to_numeric(implied_volatility, errors="coerce").reindex(close.index).astype(float).ffill().bfill()
     hv = compute_historical_volatility(close, length=hv_length, basis=hv_basis)
 
     hv_roll_max = hv.rolling(lookback).max()
@@ -170,8 +184,12 @@ def compute_sigma_reentry_signals(
       stop_short, stop_long
       hv, hv_higher, iv_higher, vol_up (if IV is supplied)
     """
+    if length < 2:
+        raise ValueError("length must be at least 2 for sigma re-entry signals.")
     px = _normalize_ohlc(df)
-    close = px[price_col].astype(float)
+    if price_col not in px.columns:
+        raise ValueError(f"price_col {price_col!r} is not present in the normalized DataFrame.")
+    close = pd.to_numeric(px[price_col], errors="coerce").astype(float)
 
     log_change = np.log(close / close.shift(1))
     sdev = log_change.rolling(length).std(ddof=1)
@@ -269,6 +287,8 @@ def summarize_sigma_signal_state(
     """
     Compact JSON-ready state for agents.
     """
+    if signal_df is None or signal_df.empty:
+        raise ValueError("signal_df is empty; cannot summarize signal state.")
     latest = signal_df.iloc[-1]
     return {
         "as_of": str(signal_df.index[-1]),
@@ -356,7 +376,7 @@ def compute_expected_move_surface(
     close = px["close"].astype(float)
     high = px["high"].astype(float)
     low = px["low"].astype(float)
-    iv = implied_volatility.astype(float)
+    iv = pd.to_numeric(implied_volatility, errors="coerce").reindex(px.index).astype(float).ffill().bfill()
 
     daily_variance = np.sqrt((iv * iv / 365.0 * 30.0) / 21.0)
     daily_variance_points = daily_variance * close.shift(1)
@@ -454,6 +474,8 @@ def summarize_expected_move_state(
     """
     Compact JSON-ready state for agents.
     """
+    if em_df is None or em_df.empty:
+        raise ValueError("em_df is empty; cannot summarize expected move state.")
     latest = em_df.iloc[-1]
     c = float(close.iloc[-1])
 
@@ -499,15 +521,18 @@ def build_options_analysis_packet(
       - weekly/monthly expected-move state from volviz.txt
     """
     px = _normalize_ohlc(df)
+    iv = pd.to_numeric(implied_volatility, errors="coerce").reindex(px.index).astype(float).ffill().bfill()
+    if iv.isna().all():
+        raise ValueError("implied_volatility has no usable values after alignment to price index.")
 
     sigma_df = compute_sigma_reentry_signals(
         px,
-        implied_volatility=implied_volatility,
+        implied_volatility=iv,
         length=sigma_length,
         require_vol_up=require_vol_up_for_sigma,
     )
-    em_df = compute_expected_move_surface(px, implied_volatility=implied_volatility)
-    hviv_df = compute_hviv_filter(px["close"], implied_volatility=implied_volatility, hv_length=hv_length)
+    em_df = compute_expected_move_surface(px, implied_volatility=iv)
+    hviv_df = compute_hviv_filter(px["close"], implied_volatility=iv, hv_length=hv_length)
 
     return {
         "as_of": str(px.index[-1]),

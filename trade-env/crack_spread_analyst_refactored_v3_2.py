@@ -51,6 +51,7 @@ import yfinance as yf
 from jsonschema import Draft202012Validator, FormatChecker
 
 from tos_options_agent_functions import build_options_analysis_packet
+from option_liquidity import OptionLiquidityConfig, choose_expiration, select_vertical_debit_spread
 
 REPORTS_DIR = Path("reports")
 REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -96,7 +97,7 @@ OUTPUT_SCHEMA = {
     "required": ["agent", "schema_version", "event_id", "strategy_type", "candidates", "summary"],
     "properties": {
         "agent": {"type": "string", "const": "crack_spread_analyst"},
-        "schema_version": {"type": "string", "const": "3.1.0"},
+        "schema_version": {"type": "string", "const": "3.2.2"},
         "event_id": {"type": "string", "format": "date-time"},
         "strategy_type": {"type": "string", "const": "crack_spread"},
         "candidates": {"type": "array", "items": COORDINATOR_CANDIDATE_SCHEMA},
@@ -122,6 +123,14 @@ class RuntimeConfig:
     proxy_weekly_interval: str = "1wk"
     proxy_daily_period: str = "1y"
     proxy_daily_interval: str = "1d"
+    min_option_open_interest: int = 20
+    min_option_volume: int = 1
+    max_bid_ask_spread_pct: float = 0.35
+    min_trade_debit: float = 0.50
+    max_trade_debit: float = 5.00
+    option_target_min_dte: int = 21
+    option_target_max_dte: int = 60
+    vertical_target_otm_pct: float = 0.08
 
 
 def now_iso() -> str:
@@ -345,6 +354,7 @@ def build_candidate(
     vol_up: bool,
     fit_score: float,
     selected_refiner: str,
+    selected_option_spread: Dict[str, Any],
     refiner_deviation_rankings: List[Dict[str, Any]],
     refiner_peer_rankings: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
@@ -375,6 +385,7 @@ def build_candidate(
             "spread_widening" if bullish_refiners else "spread_compressing",
             "vol_up_confirmed" if vol_up else "vol_neutral",
             "proxy_selected_by_peer_ranking",
+            "option_liquidity_verified",
         ],
         "implementation": {
             "signal_basis": "REFINER_MARGIN",
@@ -390,8 +401,9 @@ def build_candidate(
                 "em_state": em_state,
                 "vol_up": bool(vol_up),
             },
-            "equity_execution": f"{refiner_side} {selected_refiner} (selected by 3y weekly + 1y daily peer ranking)",
+            "equity_execution": None,
             "options_idea": f"{options_structure} on {selected_refiner} anchored to crack EM",
+            "selected_option_spread": selected_option_spread,
             "proxy_deduplicated": True,
             "refiner_rankings_by_crack_deviation": refiner_deviation_rankings,
             "refiner_rankings_by_peer_performance": refiner_peer_rankings,
@@ -407,6 +419,7 @@ def build_watchlist_entry(
     vol_up: bool,
     fit_score: float,
     selected_refiner: str,
+    selected_option_spread: Dict[str, Any],
     refiner_deviation_rankings: List[Dict[str, Any]],
     refiner_peer_rankings: List[Dict[str, Any]],
     watchlist_reason: str,
@@ -437,6 +450,7 @@ def build_watchlist_entry(
             "execution_side": refiner_side,
             "selected_refiner": selected_refiner,
             "options_idea": f"{options_structure} on {selected_refiner} anchored to crack EM",
+            "selected_option_spread": selected_option_spread,
             "vol_packet_summary": {
                 "sigma_state": sigma_state,
                 "em_state": em_state,
@@ -461,6 +475,7 @@ def evaluate_crack_with_options_context(config: RuntimeConfig, refiners_list: Li
         "refiner_rankings_by_peer_performance": [],
         "selected_refiner": None,
         "selected_refiner_side": None,
+        "selected_option_spread": None,
         "filter_reason": None,
         "watchlist_reason": None,
     }
@@ -553,6 +568,46 @@ def evaluate_crack_with_options_context(config: RuntimeConfig, refiners_list: Li
             config.verbose,
         )
 
+        # Pull the actual option chain for the selected refiner and validate the
+        # concrete debit-spread legs before this analyst is allowed to emit a
+        # candidate. This keeps the crack analyst aligned with the rule that
+        # downside must be limited to premium paid and avoids wide/illiquid chains.
+        try:
+            refiner_daily = fetch_history(selected_refiner, period=config.proxy_daily_period, interval=config.proxy_daily_interval)
+            selected_refiner_price = safe_float(refiner_daily["Close"].dropna().iloc[-1])
+        except Exception as exc:
+            diagnostics["filter_reason"] = f"SELECTED_REFINER_HISTORY_UNAVAILABLE_{exc}"
+            return None, watchlist, diagnostics
+
+        liquidity_config = OptionLiquidityConfig(
+            min_open_interest=config.min_option_open_interest,
+            min_volume=config.min_option_volume,
+            max_bid_ask_spread_pct=config.max_bid_ask_spread_pct,
+            min_trade_debit=config.min_trade_debit,
+            max_trade_debit=config.max_trade_debit,
+            min_dte=config.option_target_min_dte,
+            max_dte=config.option_target_max_dte,
+            target_otm_pct=config.vertical_target_otm_pct,
+        )
+        option_side = "BULLISH" if selected_refiner_side == "LONG" else "BEARISH"
+        _, selected_expiration, _ = choose_expiration(
+            selected_refiner,
+            config.option_target_min_dte,
+            config.option_target_max_dte,
+        )
+        selected_option_spread = select_vertical_debit_spread(
+            symbol=selected_refiner,
+            side=option_side,
+            underlying_price=float(selected_refiner_price),
+            config=liquidity_config,
+            expiration=selected_expiration,
+        )
+        diagnostics["selected_option_spread"] = selected_option_spread
+        if selected_option_spread.get("status") != "OK":
+            diagnostics["filter_reason"] = "OPTION_LIQUIDITY_FAILED"
+            log(f"   ❌ Filtered: option liquidity failed for {selected_refiner}", config.verbose)
+            return None, watchlist, diagnostics
+
         fit_score = round(0.45 * (abs(zscore) / 3.0) + 0.35 * (1.0 if vol_up else 0.0) + 0.20, 2)
         diagnostics["fit_score"] = fit_score
 
@@ -583,6 +638,7 @@ def evaluate_crack_with_options_context(config: RuntimeConfig, refiners_list: Li
                 vol_up=vol_up,
                 fit_score=fit_score,
                 selected_refiner=selected_refiner,
+                selected_option_spread=selected_option_spread,
                 refiner_deviation_rankings=refiner_deviation_rankings[:5],
                 refiner_peer_rankings=refiner_peer_rankings,
                 watchlist_reason=watchlist_reason,
@@ -598,6 +654,7 @@ def evaluate_crack_with_options_context(config: RuntimeConfig, refiners_list: Li
             vol_up=vol_up,
             fit_score=fit_score,
             selected_refiner=selected_refiner,
+            selected_option_spread=selected_option_spread,
             refiner_deviation_rankings=refiner_deviation_rankings[:5],
             refiner_peer_rankings=refiner_peer_rankings,
         )
@@ -606,12 +663,12 @@ def evaluate_crack_with_options_context(config: RuntimeConfig, refiners_list: Li
             f"   ✅ CRACK CANDIDATE ACCEPTED (fit_score={fit_score:.2f}, selected refiner={selected_refiner})\n",
             config.verbose,
         )
-        return candidate, diagnostics
+        return candidate, watchlist, diagnostics
 
     except Exception as exc:
         diagnostics["filter_reason"] = f"EXCEPTION_{exc}"
         log(f"   ❌ Exception in crack analysis: {exc}", config.verbose)
-        return None, diagnostics
+        return None, watchlist, diagnostics
 
 
 def build_crack_spread_decision(config: RuntimeConfig) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -635,7 +692,7 @@ def build_crack_spread_decision(config: RuntimeConfig) -> Tuple[Dict[str, Any], 
 
     output = {
         "agent": "crack_spread_analyst",
-        "schema_version": "3.1.0",
+        "schema_version": "3.2.2",
         "event_id": now_iso(),
         "strategy_type": "crack_spread",
         "candidates": candidates,
@@ -665,6 +722,14 @@ def build_crack_spread_decision(config: RuntimeConfig) -> Tuple[Dict[str, Any], 
             "proxy_weekly_interval": config.proxy_weekly_interval,
             "proxy_daily_period": config.proxy_daily_period,
             "proxy_daily_interval": config.proxy_daily_interval,
+            "min_option_open_interest": config.min_option_open_interest,
+            "min_option_volume": config.min_option_volume,
+            "max_bid_ask_spread_pct": config.max_bid_ask_spread_pct,
+            "min_trade_debit": config.min_trade_debit,
+            "max_trade_debit": config.max_trade_debit,
+            "option_target_min_dte": config.option_target_min_dte,
+            "option_target_max_dte": config.option_target_max_dte,
+            "vertical_target_otm_pct": config.vertical_target_otm_pct,
         },
         "watchlist": watchlist,
         "refiners": refiners,
@@ -712,6 +777,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--proxy-weekly-interval", type=str, default="1wk")
     parser.add_argument("--proxy-daily-period", type=str, default="1y")
     parser.add_argument("--proxy-daily-interval", type=str, default="1d")
+    parser.add_argument("--min-option-open-interest", type=int, default=20)
+    parser.add_argument("--min-option-volume", type=int, default=1)
+    parser.add_argument("--max-bid-ask-spread-pct", type=float, default=0.35)
+    parser.add_argument("--min-trade-debit", type=float, default=0.50)
+    parser.add_argument("--max-trade-debit", type=float, default=5.00)
+    parser.add_argument("--option-min-dte", type=int, default=21)
+    parser.add_argument("--option-max-dte", type=int, default=60)
+    parser.add_argument("--vertical-target-otm-pct", type=float, default=0.08)
     return parser
 
 
@@ -733,6 +806,14 @@ def main() -> int:
         proxy_weekly_interval=args.proxy_weekly_interval,
         proxy_daily_period=args.proxy_daily_period,
         proxy_daily_interval=args.proxy_daily_interval,
+        min_option_open_interest=args.min_option_open_interest,
+        min_option_volume=args.min_option_volume,
+        max_bid_ask_spread_pct=args.max_bid_ask_spread_pct,
+        min_trade_debit=args.min_trade_debit,
+        max_trade_debit=args.max_trade_debit,
+        option_target_min_dte=args.option_min_dte,
+        option_target_max_dte=args.option_max_dte,
+        vertical_target_otm_pct=args.vertical_target_otm_pct,
     )
 
     output, report = build_crack_spread_decision(config)

@@ -197,11 +197,12 @@ COORDINATOR_OUTPUT_SCHEMA = {
         "ranking_weights",
         "candidate_queue",
         "no_trade",
+        "trade_analysis",
         "summary",
     ],
     "properties": {
         "agent": {"type": "string", "const": "trade_coordinator"},
-        "schema_version": {"type": "string", "const": "1.1.0"},
+        "schema_version": {"type": "string", "const": "1.2.0"},
         "event_id": {"type": "string", "format": "date-time"},
         "market_bias": {
             "type": "object",
@@ -281,6 +282,7 @@ COORDINATOR_OUTPUT_SCHEMA = {
                 },
             },
         },
+        "trade_analysis": {"type": "object", "additionalProperties": True},
         "no_trade": {
             "anyOf": [
                 {"type": "null"},
@@ -633,6 +635,437 @@ def normalize_candidates(
     }
 
 
+
+# -------------------- HUMAN-READABLE TRADE ANALYSIS --------------------
+def _as_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely coerce analyst-provided numeric fields without throwing."""
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def _nested_get(obj: Dict[str, Any], *path: str, default: Any = None) -> Any:
+    """Small helper for reading deeply nested optional analyst fields."""
+    cur: Any = obj
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _money(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return f"${value:,.2f}"
+
+
+def _pct(value: Optional[float]) -> Optional[str]:
+    if value is None:
+        return None
+    return f"{value:.1%}"
+
+
+def _round_or_none(value: Optional[float], digits: int = 2) -> Optional[float]:
+    return round(float(value), digits) if value is not None else None
+
+
+def _candidate_symbol(candidate: Dict[str, Any]) -> Optional[str]:
+    impl = candidate.get("implementation", {})
+    if candidate.get("strategy_type") == "uoa":
+        return _nested_get(impl, "symbol")
+    if candidate.get("strategy_type") == "earnings":
+        return _nested_get(impl, "symbol")
+    if candidate.get("strategy_type") == "crack_spread":
+        return _nested_get(impl, "selected_refiner")
+    if candidate.get("strategy_type") == "divergence":
+        return _nested_get(impl, "signal_source", "pair_label")
+    return None
+
+
+def _extract_uoa_review(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    impl = candidate.get("implementation", {})
+    selected = impl.get("selected_trade", {})
+    contract = impl.get("contract", {})
+    quote = impl.get("quote", {})
+    flow = impl.get("observed_flow", {})
+    rr = impl.get("reward_risk", {})
+    catalyst = impl.get("catalyst", {})
+
+    return {
+        "symbol": impl.get("symbol"),
+        "company_name": impl.get("company_name"),
+        "trade_structure": selected.get("preferred_structure"),
+        "contract": contract.get("contract_string"),
+        "expiration": selected.get("expiration"),
+        "entry_price": _as_float(selected.get("estimated_entry_price")),
+        "max_loss_dollars": _as_float(selected.get("maximum_loss_per_contract")),
+        "estimated_reward_to_risk": _as_float(rr.get("estimated_reward_to_risk")),
+        "reward_risk_meets_target": bool(rr.get("reward_risk_meets_target", False)),
+        "premium": _as_float(flow.get("premium")),
+        "volume": _as_float(flow.get("volume")),
+        "open_interest": _as_float(flow.get("open_interest")),
+        "volume_open_interest_ratio": _as_float(flow.get("volume_open_interest_ratio")),
+        "ask_side_ratio": _as_float(_nested_get(flow, "side_ratios", "ask_side_ratio")),
+        "bid_ask_spread_pct": _as_float(quote.get("bid_ask_spread_pct")),
+        "dte": _as_float(contract.get("dte")),
+        "catalyst_tags": catalyst.get("catalyst_tags", []),
+        "next_earnings_date": catalyst.get("next_earnings_date"),
+        "model_note": rr.get("move_model"),
+    }
+
+
+def _extract_earnings_review(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    impl = candidate.get("implementation", {})
+    preferred = impl.get("preferred_trade", {})
+    econ = preferred.get("economics", {})
+    vol_value = impl.get("vol_value", {})
+    debit = _as_float(econ.get("estimated_max_loss"))
+    max_loss_dollars = debit * 100.0 if debit is not None else None
+
+    return {
+        "symbol": impl.get("symbol"),
+        "trade_structure": preferred.get("preferred_structure"),
+        "contract": f"{impl.get('symbol')} {preferred.get('expiration')} {preferred.get('preferred_structure')}",
+        "expiration": preferred.get("expiration"),
+        "entry_price": _as_float(econ.get("estimated_debit")),
+        "max_loss_dollars": max_loss_dollars,
+        "estimated_reward_to_risk": _as_float(econ.get("estimated_reward_to_risk")),
+        "reward_risk_meets_target": bool(econ.get("reward_risk_meets_target", False)),
+        "earnings_date": impl.get("earnings_date"),
+        "earnings_time": impl.get("earnings_time"),
+        "historical_to_implied_ratio": _as_float(vol_value.get("historical_to_implied_ratio")),
+        "historical_avg_abs_move": _as_float(vol_value.get("historical_avg_abs_move")),
+        "selected_implied_move": _as_float(vol_value.get("selected_implied_move")),
+        "vol_value_state": vol_value.get("vol_value_state"),
+        "date_validation_status": impl.get("date_validation_status"),
+    }
+
+
+def _spread_economics(spread: Optional[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    if not isinstance(spread, dict):
+        return {"debit": None, "max_loss": None, "max_reward": None, "reward_to_risk": None}
+    return {
+        "debit": _as_float(spread.get("estimated_entry_debit")),
+        "max_loss": _as_float(spread.get("estimated_max_loss")),
+        "max_reward": _as_float(spread.get("estimated_max_reward")),
+        "reward_to_risk": _as_float(spread.get("estimated_reward_to_risk")),
+    }
+
+
+def _extract_divergence_review(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    impl = candidate.get("implementation", {})
+    signal = impl.get("signal_source", {}) or impl.get("pair_metrics", {})
+    templates = impl.get("trade_templates", {})
+    short_spread = templates.get("short_leg_exact_spread")
+    long_spread = templates.get("long_leg_exact_spread")
+    short_econ = _spread_economics(short_spread)
+    long_econ = _spread_economics(long_spread)
+
+    total_debit = None
+    total_reward = None
+    if short_econ["max_loss"] is not None or long_econ["max_loss"] is not None:
+        total_debit = (short_econ["max_loss"] or 0.0) + (long_econ["max_loss"] or 0.0)
+    if short_econ["max_reward"] is not None or long_econ["max_reward"] is not None:
+        total_reward = (short_econ["max_reward"] or 0.0) + (long_econ["max_reward"] or 0.0)
+    total_rr = (total_reward / total_debit) if total_debit and total_debit > 0 and total_reward is not None else None
+
+    short_label = None
+    if isinstance(short_spread, dict):
+        short_label = f"{short_spread.get('symbol')} {short_spread.get('structure')}"
+    long_label = None
+    if isinstance(long_spread, dict):
+        long_label = f"{long_spread.get('symbol')} {long_spread.get('structure')}"
+
+    return {
+        "symbol": signal.get("pair_label"),
+        "trade_structure": "RELATIVE_VALUE_OPTION_PAIR",
+        "contract": " / ".join([x for x in [short_label, long_label] if x]),
+        "expiration": short_spread.get("expiration") if isinstance(short_spread, dict) else None,
+        "entry_price": total_debit,
+        "max_loss_dollars": total_debit * 100.0 if total_debit is not None else None,
+        "estimated_reward_to_risk": total_rr,
+        "reward_risk_meets_target": bool(total_rr is not None and total_rr >= 5.0),
+        "pair_label": signal.get("pair_label"),
+        "correlation": _as_float(signal.get("correlation")),
+        "current_zscore": _as_float(signal.get("current_zscore")),
+        "expensive_alias": signal.get("expensive_alias"),
+        "cheap_alias": signal.get("cheap_alias"),
+        "short_leg_reward_to_risk": short_econ["reward_to_risk"],
+        "long_leg_reward_to_risk": long_econ["reward_to_risk"],
+    }
+
+
+def _extract_generic_review(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    impl = candidate.get("implementation", {})
+    return {
+        "symbol": _candidate_symbol(candidate),
+        "trade_structure": candidate.get("structure_family"),
+        "contract": candidate.get("summary"),
+        "expiration": None,
+        "entry_price": None,
+        "max_loss_dollars": None,
+        "estimated_reward_to_risk": None,
+        "reward_risk_meets_target": False,
+        "implementation_keys": sorted(impl.keys()) if isinstance(impl, dict) else [],
+    }
+
+
+def extract_trade_review_fields(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize specialist-specific implementation details into common review fields."""
+    strategy = candidate.get("strategy_type")
+    if strategy == "uoa":
+        return _extract_uoa_review(candidate)
+    if strategy == "earnings":
+        return _extract_earnings_review(candidate)
+    if strategy == "divergence":
+        return _extract_divergence_review(candidate)
+    return _extract_generic_review(candidate)
+
+
+def build_candidate_review(candidate: Dict[str, Any], rank: int, duplicate_symbol_count: int = 1) -> Dict[str, Any]:
+    """
+    Create a concise, deterministic trade-review object for one coordinator candidate.
+
+    This is intentionally not an LLM summary. It uses only fields already emitted by
+    the specialist analysts and coordinator, making the review auditable and stable.
+    """
+    fields = extract_trade_review_fields(candidate)
+    strategy = candidate.get("strategy_type")
+    symbol = fields.get("symbol") or "UNKNOWN"
+    rr = _as_float(fields.get("estimated_reward_to_risk"))
+    max_loss = _as_float(fields.get("max_loss_dollars"))
+    entry = _as_float(fields.get("entry_price"))
+    ranking_score = _as_float(candidate.get("ranking_score"), 0.0) or 0.0
+    alignment = _as_float(candidate.get("market_alignment_score"), 0.0) or 0.0
+
+    strengths: List[str] = []
+    cautions: List[str] = []
+
+    if alignment >= 0.50:
+        strengths.append("Strongly aligned with current market regime.")
+    elif alignment >= 0.10:
+        strengths.append("Acceptably aligned with current market regime.")
+    elif alignment < 0:
+        cautions.append("Fights the current market regime.")
+
+    if rr is not None:
+        if rr >= 5.0:
+            strengths.append("Meets the 5:1 style reward/risk target.")
+        elif rr >= 3.0:
+            strengths.append("Has attractive defined-risk asymmetry above 3:1.")
+        elif rr < 1.5:
+            cautions.append("Reward/risk is modest and below the preferred asymmetric target.")
+        else:
+            cautions.append("Reward/risk is acceptable but below the preferred 5:1 target.")
+    else:
+        cautions.append("Reward/risk could not be estimated from analyst output.")
+
+    if strategy == "uoa":
+        premium = _as_float(fields.get("premium"))
+        ask_ratio = _as_float(fields.get("ask_side_ratio"))
+        vol_oi = _as_float(fields.get("volume_open_interest_ratio"))
+        spread = _as_float(fields.get("bid_ask_spread_pct"))
+        dte = _as_float(fields.get("dte"))
+        catalyst_tags = fields.get("catalyst_tags") or []
+        if premium is not None and premium >= 250_000:
+            strengths.append(f"Large observed premium: {_money(premium)}.")
+        if ask_ratio is not None and ask_ratio >= 0.80:
+            strengths.append("Flow appears heavily ask-side / buyer initiated.")
+        if vol_oi is not None and vol_oi >= 2.0:
+            strengths.append("Volume is meaningfully larger than open interest.")
+        if catalyst_tags:
+            strengths.append("Has near-term catalyst tags: " + ", ".join(str(x) for x in catalyst_tags) + ".")
+        if spread is not None and spread >= 0.25:
+            cautions.append("Bid/ask spread is wide; use strict limit orders.")
+        if dte is not None and dte <= 5:
+            cautions.append("Very short-dated option; timing risk is high.")
+        if str(fields.get("model_note", "")).startswith("fallback"):
+            cautions.append("Reward/risk uses fallback move model because IV/Greeks were missing.")
+
+    elif strategy == "earnings":
+        ratio = _as_float(fields.get("historical_to_implied_ratio"))
+        hist = _as_float(fields.get("historical_avg_abs_move"))
+        implied = _as_float(fields.get("selected_implied_move"))
+        if ratio is not None and ratio >= 1.25:
+            strengths.append("Historical earnings move is larger than the current implied move.")
+        if fields.get("date_validation_status") == "CONFIRMED_3_SOURCE":
+            strengths.append("Earnings date is confirmed by multiple sources.")
+        if hist is not None and implied is not None:
+            strengths.append(f"Historical avg move {_pct(hist)} vs implied move {_pct(implied)}.")
+        if rr is not None and rr <= 1.1:
+            cautions.append("ATM straddle economics are roughly 1:1 unless the move exceeds implied range.")
+
+    elif strategy == "divergence":
+        corr = _as_float(fields.get("correlation"))
+        z = _as_float(fields.get("current_zscore"))
+        short_rr = _as_float(fields.get("short_leg_reward_to_risk"))
+        long_rr = _as_float(fields.get("long_leg_reward_to_risk"))
+        if corr is not None and corr >= 0.80:
+            strengths.append("Pair correlation is high enough for a cleaner relative-value signal.")
+        if z is not None and abs(z) >= 2.0:
+            strengths.append("Spread z-score is meaningfully extended.")
+        if short_rr is not None and long_rr is not None and min(short_rr, long_rr) < 1.25:
+            cautions.append("One leg has weak spread economics and may drag down the pair trade.")
+
+    if duplicate_symbol_count > 1:
+        cautions.append(f"Duplicate exposure: {symbol} appears {duplicate_symbol_count} times in the forwarded queue.")
+
+    if max_loss is not None and max_loss > 500:
+        cautions.append("One-lot max loss is above $500; position sizing needs extra care.")
+
+    actionability_score = round(
+        ranking_score
+        + (0.08 if rr is not None and rr >= 3.0 else 0.0)
+        + (0.06 if max_loss is not None and max_loss <= 150 else 0.0)
+        - (0.05 * min(len(cautions), 4)),
+        4,
+    )
+
+    thesis = candidate.get("summary", "")
+    plain_english = (
+        f"#{rank}: {symbol} from {strategy}. {thesis} "
+        f"Estimated R/R={rr:.2f}:1." if rr is not None else f"#{rank}: {symbol} from {strategy}. {thesis}"
+    )
+
+    return {
+        "rank": rank,
+        "candidate_id": candidate.get("candidate_id"),
+        "strategy_type": strategy,
+        "symbol": symbol,
+        "direction": candidate.get("direction"),
+        "ranking_score": ranking_score,
+        "market_alignment_score": alignment,
+        "trade_structure": fields.get("trade_structure"),
+        "contract": fields.get("contract"),
+        "expiration": fields.get("expiration"),
+        "entry_price": _round_or_none(entry, 4),
+        "max_loss_dollars": _round_or_none(max_loss, 2),
+        "estimated_reward_to_risk": _round_or_none(rr, 4),
+        "reward_risk_meets_target": bool(fields.get("reward_risk_meets_target", False)),
+        "actionability_score": actionability_score,
+        "strengths": strengths[:6],
+        "cautions": cautions[:6],
+        "plain_english": plain_english,
+    }
+
+
+def _choose_review(reviews: List[Dict[str, Any]], key: str) -> Optional[Dict[str, Any]]:
+    if not reviews:
+        return None
+    if key == "best_overall":
+        return max(reviews, key=lambda r: r.get("actionability_score", -999.0))
+    if key == "best_cheapest":
+        priced = [r for r in reviews if r.get("max_loss_dollars") is not None]
+        return min(priced, key=lambda r: (r["max_loss_dollars"], -r.get("ranking_score", 0.0))) if priced else None
+    if key == "best_moonshot":
+        candidates = [r for r in reviews if r.get("estimated_reward_to_risk") is not None]
+        if not candidates:
+            candidates = reviews
+        return max(candidates, key=lambda r: (r.get("estimated_reward_to_risk") or 0.0, -r.get("max_loss_dollars") if r.get("max_loss_dollars") is not None else 0.0))
+    if key == "most_caution":
+        return max(reviews, key=lambda r: (len(r.get("cautions", [])), r.get("ranking_score", 0.0)))
+    return None
+
+
+def _summary_stub(review: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if review is None:
+        return None
+    return {
+        "candidate_id": review.get("candidate_id"),
+        "symbol": review.get("symbol"),
+        "strategy_type": review.get("strategy_type"),
+        "contract": review.get("contract"),
+        "max_loss_dollars": review.get("max_loss_dollars"),
+        "estimated_reward_to_risk": review.get("estimated_reward_to_risk"),
+        "why": review.get("plain_english"),
+        "main_cautions": review.get("cautions", [])[:3],
+    }
+
+
+def build_trade_analysis(
+    market: Dict[str, Any],
+    candidate_queue: List[Dict[str, Any]],
+    no_trade: Optional[Dict[str, Any]],
+    coordinator_bias: str,
+) -> Dict[str, Any]:
+    """
+    Build a trader-readable analysis block from the final coordinator queue.
+
+    The coordinator still does not place trades. This section explains why the
+    queue looks the way it does and highlights which forwarded candidates deserve
+    the most attention or caution.
+    """
+    forwarded = [row for row in candidate_queue if row.get("status") == "FORWARD"]
+    strategy_counts: Dict[str, int] = {strategy: 0 for strategy in ALLOWED_STRATEGIES}
+    symbol_counts: Dict[str, int] = {}
+    for row in forwarded:
+        strategy_counts[row.get("strategy_type", "unknown")] = strategy_counts.get(row.get("strategy_type", "unknown"), 0) + 1
+        sym = _candidate_symbol(row) or "UNKNOWN"
+        symbol_counts[sym] = symbol_counts.get(sym, 0) + 1
+
+    if no_trade is not None:
+        return {
+            "analysis_version": "1.0.0",
+            "market_takeaway": f"Coordinator bias is {coordinator_bias}. No trade was forwarded.",
+            "strategy_mix": strategy_counts,
+            "top_recommendations": {},
+            "reviews": [],
+            "plain_english_summary": [no_trade.get("summary", "No trade was forwarded.")],
+        }
+
+    reviews = [
+        build_candidate_review(row, rank=i + 1, duplicate_symbol_count=symbol_counts.get(_candidate_symbol(row) or "UNKNOWN", 1))
+        for i, row in enumerate(forwarded)
+    ]
+
+    best_overall = _choose_review(reviews, "best_overall")
+    best_cheapest = _choose_review(reviews, "best_cheapest")
+    best_moonshot = _choose_review(reviews, "best_moonshot")
+    most_caution = _choose_review(reviews, "most_caution")
+
+    st = normalize_horizon_block(market["short_term"])
+    lt = normalize_horizon_block(market["long_term"])
+    market_takeaway = (
+        f"Market regime is {coordinator_bias}. Short-term is {st['normalized_regime']} "
+        f"with {st['confidence']:.2f} confidence; long-term is {lt['normalized_regime']} "
+        f"with {lt['confidence']:.2f} confidence."
+    )
+
+    plain_summary: List[str] = [market_takeaway]
+    if best_overall:
+        plain_summary.append(f"Best overall candidate: {best_overall['symbol']} ({best_overall['candidate_id']}).")
+    if best_cheapest:
+        plain_summary.append(f"Best cheapest candidate by one-lot max loss: {best_cheapest['symbol']} ({_money(best_cheapest.get('max_loss_dollars'))}).")
+    if best_moonshot:
+        rr = best_moonshot.get("estimated_reward_to_risk")
+        rr_text = f"{rr:.2f}:1" if rr is not None else "unknown R/R"
+        plain_summary.append(f"Best aggressive/moonshot profile: {best_moonshot['symbol']} with estimated R/R {rr_text}.")
+    if most_caution:
+        plain_summary.append(f"Highest-caution forwarded idea: {most_caution['symbol']} — {'; '.join(most_caution.get('cautions', [])[:2])}.")
+
+    return {
+        "analysis_version": "1.0.0",
+        "market_takeaway": market_takeaway,
+        "strategy_mix": strategy_counts,
+        "duplicate_forwarded_symbols": {k: v for k, v in symbol_counts.items() if v > 1},
+        "top_recommendations": {
+            "best_overall": _summary_stub(best_overall),
+            "best_cheapest": _summary_stub(best_cheapest),
+            "best_aggressive_moonshot": _summary_stub(best_moonshot),
+            "one_to_review_or_avoid": _summary_stub(most_caution),
+        },
+        "reviews": reviews,
+        "plain_english_summary": plain_summary,
+        "execution_reminder": (
+            "FORWARD means the idea passed coordinator filters; it is not an order instruction. "
+            "Validate live bid/ask, liquidity, updated news, and position size before entry."
+        ),
+    }
+
 def build_output(
     market: Dict[str, Any],
     specialist_payloads: List[Dict[str, Any]],
@@ -651,7 +1084,7 @@ def build_output(
 
     output = {
         "agent": "trade_coordinator",
-        "schema_version": "1.1.0",
+        "schema_version": "1.2.0",
         "event_id": now_iso(),
         "market_bias": {
             "model_preference": "3_STATE_V2",
@@ -663,6 +1096,7 @@ def build_output(
         "ranking_weights": weights,
         "candidate_queue": candidate_queue,
         "no_trade": no_trade,
+        "trade_analysis": build_trade_analysis(market, candidate_queue, no_trade, coordinator_bias),
         "summary": "",
     }
 
