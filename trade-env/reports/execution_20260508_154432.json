@@ -1,8 +1,0 @@
-{
-  "execution_event_id": "exec_20260508_204432",
-  "status": "EXECUTED",
-  "approved_allocations": [],
-  "profit_transfer": 0.0,
-  "timestamp": "2026-05-08T20:44:32.368731+00:00",
-  "audit_note": "All agents were advisory only. Execution performed by deterministic service."
-}
