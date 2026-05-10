@@ -1,0 +1,261 @@
+{
+  "output": {
+    "agent": "crack_spread_analyst",
+    "schema_version": "3.2.2",
+    "event_id": "2026-05-08T18:53:21.693255+00:00",
+    "strategy_type": "crack_spread",
+    "candidates": [],
+    "summary": "Crack Spread Analyst identified 0 refiner-margin opportunities and 0 watchlist setups using normalized crack, sigma reentry, expected-move filters, and peer-relative refiner ranking."
+  },
+  "diagnostics": {
+    "current_crack_spread": 53.15,
+    "normalized_crack_pct": 100.0693,
+    "sigma_state": "NO_SIGNAL",
+    "expected_move_state": "OUTSIDE_MONTH_EM",
+    "vol_up": false,
+    "normalized_crack_zscore": 0.894,
+    "refiner_rankings_by_crack_deviation": [
+      {
+        "symbol": "PBF",
+        "norm_pct": -19.36,
+        "deviation_from_crack": -119.43,
+        "abs_deviation": 119.43
+      },
+      {
+        "symbol": "CVI",
+        "norm_pct": 13.34,
+        "deviation_from_crack": -86.73,
+        "abs_deviation": 86.73
+      },
+      {
+        "symbol": "PSX",
+        "norm_pct": 16.11,
+        "deviation_from_crack": -83.96,
+        "abs_deviation": 83.96
+      },
+      {
+        "symbol": "SUN",
+        "norm_pct": 18.78,
+        "deviation_from_crack": -81.29,
+        "abs_deviation": 81.29
+      },
+      {
+        "symbol": "DINO",
+        "norm_pct": 27.02,
+        "deviation_from_crack": -73.05,
+        "abs_deviation": 73.05
+      },
+      {
+        "symbol": "MPC",
+        "norm_pct": 35.67,
+        "deviation_from_crack": -64.4,
+        "abs_deviation": 64.4
+      },
+      {
+        "symbol": "VLO",
+        "norm_pct": 53.78,
+        "deviation_from_crack": -46.29,
+        "abs_deviation": 46.29
+      },
+      {
+        "symbol": "DK",
+        "norm_pct": 65.3,
+        "deviation_from_crack": -34.77,
+        "abs_deviation": 34.77
+      }
+    ],
+    "refiner_rankings_by_peer_performance": [
+      {
+        "symbol": "DK",
+        "weekly_3y_return_pct": 108.2353,
+        "daily_1y_return_pct": 201.3752,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.6875,
+        "daily_1y_percentile": 0.9375,
+        "peer_expensiveness_score": 0.625,
+        "peer_rank": "EXPENSIVE"
+      },
+      {
+        "symbol": "VLO",
+        "weekly_3y_return_pct": 118.4039,
+        "daily_1y_return_pct": 98.4268,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.8125,
+        "daily_1y_percentile": 0.5625,
+        "peer_expensiveness_score": 0.375,
+        "peer_rank": "EXPENSIVE"
+      },
+      {
+        "symbol": "MPC",
+        "weekly_3y_return_pct": 123.3983,
+        "daily_1y_return_pct": 63.6794,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.9375,
+        "daily_1y_percentile": 0.4375,
+        "peer_expensiveness_score": 0.375,
+        "peer_rank": "EXPENSIVE"
+      },
+      {
+        "symbol": "DINO",
+        "weekly_3y_return_pct": 80.6242,
+        "daily_1y_return_pct": 112.0164,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.4375,
+        "daily_1y_percentile": 0.8125,
+        "peer_expensiveness_score": 0.25,
+        "peer_rank": "MID"
+      },
+      {
+        "symbol": "PBF",
+        "weekly_3y_return_pct": 15.2075,
+        "daily_1y_return_pct": 109.6741,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.0625,
+        "daily_1y_percentile": 0.6875,
+        "peer_expensiveness_score": -0.25,
+        "peer_rank": "MID"
+      },
+      {
+        "symbol": "PSX",
+        "weekly_3y_return_pct": 83.0187,
+        "daily_1y_return_pct": 56.2506,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.5625,
+        "daily_1y_percentile": 0.1875,
+        "peer_expensiveness_score": -0.25,
+        "peer_rank": "MID"
+      },
+      {
+        "symbol": "CVI",
+        "weekly_3y_return_pct": 39.7818,
+        "daily_1y_return_pct": 58.2423,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.1875,
+        "daily_1y_percentile": 0.3125,
+        "peer_expensiveness_score": -0.5,
+        "peer_rank": "CHEAP"
+      },
+      {
+        "symbol": "SUN",
+        "weekly_3y_return_pct": 54.9051,
+        "daily_1y_return_pct": 19.8938,
+        "weekly_rows": 157,
+        "daily_rows": 252,
+        "weekly_3y_percentile": 0.3125,
+        "daily_1y_percentile": 0.0625,
+        "peer_expensiveness_score": -0.625,
+        "peer_rank": "CHEAP"
+      }
+    ],
+    "selected_refiner": "DK",
+    "selected_refiner_side": "SHORT",
+    "selected_option_spread": {
+      "liquidity_pass": false,
+      "premium_in_preferred_range": true,
+      "reasons": [
+        "long_wide_bid_ask_spread",
+        "short_bad_bid_ask_quote",
+        "short_low_open_interest",
+        "short_wide_bid_ask_spread"
+      ],
+      "symbol": "DK",
+      "expiration": "2026-06-18",
+      "dte": 41,
+      "side": "BEARISH",
+      "structure": "PUT_DEBIT_SPREAD",
+      "option_type": "PUT",
+      "underlying_price": 46.02,
+      "long_leg": {
+        "action": "BUY",
+        "type": "PUT",
+        "strike": 35.0,
+        "contract_symbol": "DK260618P00035000",
+        "liquidity": {
+          "ok": false,
+          "bid": 0.15,
+          "ask": 0.5,
+          "mid": 0.325,
+          "open_interest": 49,
+          "volume": 1,
+          "bid_ask_spread_pct": 1.0769,
+          "reasons": [
+            "wide_bid_ask_spread"
+          ]
+        }
+      },
+      "short_leg": {
+        "action": "SELL",
+        "type": "PUT",
+        "strike": 25.0,
+        "contract_symbol": "DK260618P00025000",
+        "liquidity": {
+          "ok": false,
+          "bid": 0.0,
+          "ask": 1.15,
+          "mid": 0.575,
+          "open_interest": 6,
+          "volume": 4,
+          "bid_ask_spread_pct": 2.0,
+          "reasons": [
+            "bad_bid_ask_quote",
+            "low_open_interest",
+            "wide_bid_ask_spread"
+          ]
+        }
+      },
+      "width": 10.0,
+      "estimated_entry_debit": 0.5,
+      "estimated_mid_debit": -0.25,
+      "estimated_max_loss": 0.5,
+      "estimated_max_reward": 9.5,
+      "estimated_reward_to_risk": 19.0,
+      "status": "FAILED_LIQUIDITY",
+      "reason": "OPTION_LIQUIDITY_FAILED",
+      "evaluated_candidate_count": 28
+    },
+    "filter_reason": "OPTION_LIQUIDITY_FAILED",
+    "watchlist_reason": null
+  },
+  "config": {
+    "daily_period": "2y",
+    "daily_interval": "1d",
+    "zscore_window": 63,
+    "min_abs_z": 1.0,
+    "watchlist_min_abs_z": 0.75,
+    "min_fit_score": 0.55,
+    "watchlist_min_fit_score": 0.35,
+    "max_candidates": 6,
+    "require_vol_up": true,
+    "sigma_length": 21,
+    "proxy_weekly_period": "3y",
+    "proxy_weekly_interval": "1wk",
+    "proxy_daily_period": "1y",
+    "proxy_daily_interval": "1d",
+    "min_option_open_interest": 20,
+    "min_option_volume": 1,
+    "max_bid_ask_spread_pct": 0.35,
+    "min_trade_debit": 0.5,
+    "max_trade_debit": 5.0,
+    "option_target_min_dte": 21,
+    "option_target_max_dte": 60,
+    "vertical_target_otm_pct": 0.08
+  },
+  "watchlist": [],
+  "refiners": [
+    "VLO",
+    "MPC",
+    "DINO",
+    "PBF",
+    "PSX",
+    "SUN",
+    "DK",
+    "CVI"
+  ]
+}

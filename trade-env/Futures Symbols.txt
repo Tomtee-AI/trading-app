@@ -1,0 +1,29 @@
+Futures Symbols
+Metals Futures Symbols = GC, SI, HG, PL
+Indices Futures Symbols = NQ, ES, RTY
+Energies Futures Symbols = CL, HO, RB, NG
+Bonds Futures Symbols = ZT, ZF, ZN, ZB, UB
+Crypto Futures Symbols = BTC, ETH, SOL, XRP
+
+Stock Future Proxies
+GC = GLD, GDX, GDXJ, B
+SI = SLV, AG, HL, PAAS
+HG = FCX, BHP, TECK, SCCO
+PL = PPLT, SBSW, PLTM, PLG, SPPP
+NQ = QQQ
+ES = SPY
+RTY = IWM
+CL = MTDR, XOM, NOG, WHD
+HO = VLO, MPC, DINO, PBF
+RB = PSX, SUN, DK, CVI
+NG = AR, LNG, UNG
+ZF = IEI
+ZN = IEF
+ZB = TLT 
+BTC = IBIT, MSTR
+ETH = ETHA, SBET, BMNR
+SOL = GSOL, BSOL, SSK, QSOL
+XRP = XRPR, XRPI, XXRP, UXRP
+Lithium = ALB, SQM, LAC, SGML
+Uranium = UROY, CCJ, LEU, URA
+Refiners = VLO, MPC, DINO, PBF, PSX, SUN, DK, CVI
