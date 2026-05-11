@@ -32,8 +32,11 @@ def build_unusual_options_decision() -> Dict[str, Any]:
     # Run the full rich analysis with conservative defaults
     config = RuntimeConfig()                    # all your guardrails applied
     payload, full_report = build_payload(config)
+    diagnostics = full_report.get("diagnostics", {})
+    watchlist = full_report.get("watchlist", [])
 
-    # Light wrapper metadata for pipeline traceability
+    # Keep rich diagnostics embedded for the full pipeline report while leaving
+    # the coordinator-facing candidate contract unchanged.
     output = {
         "agent": "unusual_options_analyst",
         "event_id": f"uoa_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
@@ -44,8 +47,15 @@ def build_unusual_options_decision() -> Dict[str, Any]:
         "metadata": {
             "schema_version": "2.2.0",
             "source": "unusual_options_analyst",
-            "input_rows": full_report.get("diagnostics", {}).get("input_rows", 0),
-            "report_path": str(full_report.get("report_path", "N/A"))
+            "input_file": full_report.get("input_file"),
+            "input_rows": diagnostics.get("input_rows", 0),
+            "candidate_count_before_cap": diagnostics.get("candidate_count_before_cap", 0),
+            "watchlist_count_before_cap": diagnostics.get("watchlist_count_before_cap", 0),
+            "rejected_count": diagnostics.get("rejected_count", 0),
+            "reason_counts": diagnostics.get("reason_counts", {}),
+            "watchlist": watchlist,
+            "rejected_sample": diagnostics.get("rejected", [])[:25],
+            "report_path": "embedded_in_full_pipeline_report"
         }
     }
     return output
@@ -53,5 +63,5 @@ def build_unusual_options_decision() -> Dict[str, Any]:
 
 if __name__ == "__main__":
     result = build_unusual_options_decision()
-    print(f"✅ Unusual Options Analyst completed — {len(result.get('candidates', []))} candidates")
+    print(f"Unusual Options Analyst completed - {len(result.get('candidates', []))} candidates")
     print(f"   Event ID: {result.get('event_id')}")

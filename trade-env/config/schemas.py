@@ -45,7 +45,9 @@ class PortfolioDecision(BaseModel):
     model_config = ConfigDict(extra="forbid")
     agent: str = "portfolio_risk_manager"
     event_id: str
+    approved: bool = True
     approved_allocations: List[Dict[str, Any]]
+    candidate_reviews: List[Dict[str, Any]] = Field(default_factory=list)
     veto_reasons: List[str]
     profit_transfer_amount: float
     tactical_exposure: float

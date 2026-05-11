@@ -37,7 +37,12 @@ class ConscienceAgent:
             approved = False
 
         # High-conviction concentration check (example)
-        if len(portfolio_decision.get("approved_allocations", [])) > 3:
+        tactical_allocations = [
+            allocation
+            for allocation in portfolio_decision.get("approved_allocations", [])
+            if allocation.get("action") != "PROFIT_TRANSFER"
+        ]
+        if len(tactical_allocations) > 3:
             veto_reasons.append("Too many simultaneous tactical positions")
             approved = False
 
