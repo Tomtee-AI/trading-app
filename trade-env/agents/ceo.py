@@ -27,16 +27,30 @@ class CEOAgent:
         conscience: Dict[str, Any]
     ) -> CEOOutput:
         strategic_directive = "CONTINUE_TACTICAL_ALPHA_GENERATION" if conscience.get("approved", True) else "PAUSE_ALL_TACTICAL"
+        coordinator_bias = (
+            coordinator.get("metadata", {}).get("coordinator_bias")
+            or coordinator.get("trade_analysis", {}).get("market_takeaway")
+            or coordinator.get("market_bias", {}).get("coordinator_bias")
+            or "UNKNOWN"
+        )
+        short_term_regime = market.get("short_term", {}).get("regime", "UNKNOWN")
+        long_term_regime = market.get("long_term", {}).get("regime", "UNKNOWN")
 
         output = CEOOutput(
             agent="ceo",
             event_id=f"ceo_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}",
             strategic_directive=strategic_directive,
-            summary=f"CEO directive: {strategic_directive}. Market regime is {market.get('short_term', {}).get('regime')}. "
-                    f"Conscience status: {conscience.get('review_status')}.",
+            summary=(
+                f"CEO directive: {strategic_directive}. Coordinator bias is {coordinator_bias}. "
+                f"Short-term regime is {short_term_regime}; long-term regime is {long_term_regime}. "
+                f"Conscience status: {conscience.get('review_status')}."
+            ),
             metadata={
                 "schema_version": "1.0",
                 "validated_at": datetime.now(timezone.utc).isoformat(),
+                "coordinator_bias": coordinator_bias,
+                "short_term_regime": short_term_regime,
+                "long_term_regime": long_term_regime,
                 "tactical_vs_retirement_alignment": "STRONG" if portfolio.get("profit_transfer_amount", 0) > 0 else "NEUTRAL"
             }
         )

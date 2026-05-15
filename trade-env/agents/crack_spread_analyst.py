@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 def build_crack_spread_decision() -> Dict[str, Any]:
     """Crack Spread Strategy Specialist — produces CoordinatorCandidate payloads."""
+    rich_report = {}
     try:
         # Direct import of rich function + its config class
         from crack_spread_analyst import build_crack_spread_decision as rich_build, RuntimeConfig
@@ -24,6 +25,7 @@ def build_crack_spread_decision() -> Dict[str, Any]:
         # Handle tuple return from rich function (output, internal_report)
         if isinstance(result, tuple):
             output = result[0] if len(result) > 0 else {}
+            rich_report = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
         else:
             output = result
 
@@ -43,6 +45,7 @@ def build_crack_spread_decision() -> Dict[str, Any]:
             result = rich_build(config)
             if isinstance(result, tuple):
                 output = result[0] if len(result) > 0 else {}
+                rich_report = result[1] if len(result) > 1 and isinstance(result[1], dict) else {}
             else:
                 output = result
         else:
@@ -58,6 +61,14 @@ def build_crack_spread_decision() -> Dict[str, Any]:
             "schema_version": "2.2.0",
             "source": "crack_spread_analyst"
         }
+    if rich_report:
+        metadata = output.setdefault("metadata", {})
+        metadata.setdefault("schema_version", "2.2.0")
+        metadata.setdefault("source", "crack_spread_analyst")
+        metadata["watchlist"] = rich_report.get("watchlist", [])
+        metadata["diagnostics"] = rich_report.get("diagnostics", {})
+        metadata["config"] = rich_report.get("config", {})
+        metadata["watchlist_count"] = len(rich_report.get("watchlist", []))
 
     return output
 

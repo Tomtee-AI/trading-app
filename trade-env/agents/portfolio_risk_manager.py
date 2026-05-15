@@ -18,6 +18,10 @@ from config.schemas import PortfolioDecision, TradeCoordinatorOutput
 from services.validation import validate_portfolio_decision
 
 
+PREFERRED_DEBIT_MIN = 0.50
+PREFERRED_DEBIT_MAX = 5.00
+
+
 def _as_float(value, default=None):
     try:
         if value is None:
@@ -42,6 +46,7 @@ def _spread_economics(spread: Dict[str, Any]) -> Dict[str, Any]:
             "premium_in_preferred_range": False,
             "symbol": None,
             "structure": None,
+            "reasons": [],
         }
 
     return {
@@ -54,6 +59,7 @@ def _spread_economics(spread: Dict[str, Any]) -> Dict[str, Any]:
         "symbol": spread.get("symbol"),
         "structure": spread.get("structure"),
         "expiration": spread.get("expiration"),
+        "reasons": spread.get("reasons", []),
     }
 
 
@@ -97,11 +103,76 @@ def _candidate_economics(candidate: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _candidate_veto_details(economics: Dict[str, Any]) -> list:
+    details = []
+    legs = economics.get("legs", [])
+
+    for index, leg in enumerate(legs, start=1):
+        label = " ".join(
+            str(value)
+            for value in [leg.get("symbol"), leg.get("structure"), leg.get("expiration")]
+            if value
+        ) or f"leg_{index}"
+
+        if not leg.get("liquidity_pass"):
+            details.append({
+                "reason_code": "OPTION_LIQUIDITY_NOT_VERIFIED",
+                "leg": label,
+                "observed_reasons": leg.get("reasons", []),
+            })
+
+        if not leg.get("premium_in_preferred_range"):
+            details.append({
+                "reason_code": "PREMIUM_OUTSIDE_PREFERRED_RANGE",
+                "leg": label,
+                "observed_entry_debit": _round_or_none(leg.get("entry_debit"), 4),
+                "preferred_entry_debit_min": PREFERRED_DEBIT_MIN,
+                "preferred_entry_debit_max": PREFERRED_DEBIT_MAX,
+                "observed_reasons": leg.get("reasons", []),
+            })
+
+        if leg.get("max_loss") in (None, 0):
+            details.append({
+                "reason_code": "MISSING_MAX_LOSS",
+                "leg": label,
+                "observed_max_loss": leg.get("max_loss"),
+            })
+
+    if not legs and economics.get("total_max_loss") in (None, 0):
+        details.append({
+            "reason_code": "MISSING_MAX_LOSS",
+            "leg": "selected_trade",
+            "observed_max_loss": economics.get("total_max_loss"),
+        })
+
+    return details
+
+
+def _candidate_warnings(economics: Dict[str, Any]) -> list:
+    warnings = []
+    for index, leg in enumerate(economics.get("legs", []), start=1):
+        rr = leg.get("reward_to_risk")
+        if rr is not None and rr < PortfolioRiskManager.MIN_LEG_REWARD_TO_RISK_WARNING:
+            label = " ".join(
+                str(value)
+                for value in [leg.get("symbol"), leg.get("structure"), leg.get("expiration")]
+                if value
+            ) or f"leg_{index}"
+            warnings.append({
+                "warning_code": "LEG_REWARD_TO_RISK_BELOW_WARNING_THRESHOLD",
+                "leg": label,
+                "observed_reward_to_risk": _round_or_none(rr, 4),
+                "warning_threshold": PortfolioRiskManager.MIN_LEG_REWARD_TO_RISK_WARNING,
+            })
+    return warnings
+
+
 class PortfolioRiskManager:
     TACTICAL_MAX_EXPOSURE_PCT = 0.15   # 15% of total capital max for leverage book
     MIN_PROFIT_SWEEP_PCT = 0.60        # Sweep 60% of tactical profits to retirement book
     MAX_APPROVED_TRADE_CANDIDATES = 3
     MIN_REWARD_TO_RISK_FOR_APPROVAL = 3.0
+    MIN_LEG_REWARD_TO_RISK_WARNING = 2.0
 
     @staticmethod
     def build_portfolio_decision(
@@ -116,6 +187,8 @@ class PortfolioRiskManager:
         profit_transfer = 0.0
         proposed_tactical = 0.0
         portfolio_approved = True
+        passed_review_count = 0
+        review_cap_note = ""
 
         if coordinator.no_trade:
             veto_reasons.append("Coordinator issued no_trade decision")
@@ -144,11 +217,14 @@ class PortfolioRiskManager:
                     candidate_reasons.append("REWARD_TO_RISK_BELOW_PORTFOLIO_MINIMUM")
 
                 review_status = "APPROVED_FOR_REVIEW" if not candidate_reasons else "VETOED"
+                warnings = _candidate_warnings(economics)
                 review = {
                     "candidate_id": candidate.get("candidate_id"),
                     "strategy_type": candidate.get("strategy_type"),
                     "status": review_status,
                     "reason_codes": candidate_reasons or ["PASSED_PORTFOLIO_REVIEW"],
+                    "veto_details": _candidate_veto_details(economics) if candidate_reasons else [],
+                    "warnings": warnings,
                     "ranking_score": candidate.get("ranking_score"),
                     "market_alignment_score": candidate.get("market_alignment_score"),
                     "estimated_max_loss_dollars": _round_or_none((economics.get("total_max_loss") or 0.0) * 100.0),
@@ -174,6 +250,18 @@ class PortfolioRiskManager:
                     "estimated_reward_to_risk": review["estimated_reward_to_risk"],
                     "allocation_note": "Research approval only; no broker order is placed.",
                 })
+
+            passed_review_count = len([
+                review
+                for review in candidate_reviews
+                if review["status"] == "APPROVED_FOR_REVIEW"
+            ])
+            review_cap_note = ""
+            if passed_review_count > PortfolioRiskManager.MAX_APPROVED_TRADE_CANDIDATES:
+                review_cap_note = (
+                    f" Capped approved allocations at "
+                    f"{PortfolioRiskManager.MAX_APPROVED_TRADE_CANDIDATES} trade candidates."
+                )
 
             proposed_tactical = min(
                 len(approved_allocations) * 0.03,
@@ -206,7 +294,9 @@ class PortfolioRiskManager:
             retirement_exposure=round(current_retirement_balance + profit_transfer, 2),
             summary=(
                 f"Portfolio & Risk Manager reviewed {len(candidate_reviews)} forwarded candidates; "
-                f"{len([r for r in candidate_reviews if r['status'] == 'APPROVED_FOR_REVIEW'])} passed candidate review."
+                f"{passed_review_count} passed candidate review; "
+                f"{len([a for a in approved_allocations if a.get('action') == 'REVIEW_TRADE_CANDIDATE'])} "
+                f"were approved for research allocation.{review_cap_note}"
             )
         )
 

@@ -51,7 +51,11 @@ def run_daily_pipeline():
     if ceo.strategic_directive == "CONTINUE_TACTICAL_ALPHA_GENERATION" and conscience.approved:
         execution = ExecutionService.execute(portfolio.model_dump(), ceo.model_dump())
     else:
-        execution = {"status": "PAUSED", "reason": "CEO or Conscience veto"}
+        execution = {
+            "status": "PAUSED",
+            "reason": "CEO or Conscience veto",
+            "execution_note": "Daily pipeline paused before deterministic execution.",
+        }
 
     # === HUMAN-READABLE SUMMARY ===
     print("\n" + "="*90)

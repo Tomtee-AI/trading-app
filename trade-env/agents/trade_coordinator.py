@@ -22,6 +22,7 @@ from trade_coordinator_bias_aware_skeleton import (
     derive_coordinator_bias,
     build_strategy_permissions,
     build_ranking_weights,
+    build_trade_analysis,
     normalize_candidates,
     RuntimeConfig   # ← This was missing
 )
@@ -41,14 +42,22 @@ def build_trade_coordinator_decision(
         max_queue_size=20
     )
 
+    market_payload = market.model_dump()
+
     # Reuse your battle-tested logic with correct arguments
     candidate_queue, no_trade = normalize_candidates(
-        market.model_dump(), 
+        market_payload,
         specialist_payloads,
         config
     )
 
-    coordinator_bias = derive_coordinator_bias(market.model_dump())
+    coordinator_bias = derive_coordinator_bias(market_payload)
+    trade_analysis = build_trade_analysis(
+        market_payload,
+        candidate_queue,
+        no_trade,
+        coordinator_bias,
+    )
 
     output = TradeCoordinatorOutput(
         agent="trade_coordinator",
@@ -58,6 +67,11 @@ def build_trade_coordinator_decision(
         ranking_weights=build_ranking_weights(coordinator_bias),
         candidate_queue=candidate_queue,
         no_trade=no_trade,
+        trade_analysis=trade_analysis,
+        metadata={
+            "coordinator_bias": coordinator_bias,
+            "data_quality_warnings": trade_analysis.get("data_quality_warnings", []),
+        },
         summary=f"Coordinator bias: {coordinator_bias}. "
                 f"Forwarded {len([c for c in candidate_queue if c.get('status') == 'FORWARD'])} candidates."
     )

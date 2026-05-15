@@ -53,6 +53,11 @@ def build_unusual_options_decision() -> Dict[str, Any]:
             "watchlist_count_before_cap": diagnostics.get("watchlist_count_before_cap", 0),
             "rejected_count": diagnostics.get("rejected_count", 0),
             "reason_counts": diagnostics.get("reason_counts", {}),
+            "reason_buckets": diagnostics.get("reason_buckets", {}),
+            "watchlist_reason_counts": diagnostics.get("watchlist_reason_counts", {}),
+            "watchlist_reason_buckets": diagnostics.get("watchlist_reason_buckets", {}),
+            "rejected_reason_counts": diagnostics.get("rejected_reason_counts", {}),
+            "rejected_reason_buckets": diagnostics.get("rejected_reason_buckets", {}),
             "watchlist": watchlist,
             "rejected_sample": diagnostics.get("rejected", [])[:25],
             "report_path": "embedded_in_full_pipeline_report"

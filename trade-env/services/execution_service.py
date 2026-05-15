@@ -30,6 +30,7 @@ class ExecutionService:
                 "approved_allocations": [],
                 "profit_transfer": 0.0,
                 "timestamp": timestamp,
+                "execution_note": "CEO strategic directive paused tactical execution.",
             }
 
         if not portfolio_decision.get("approved", True):
@@ -40,6 +41,7 @@ class ExecutionService:
                 "approved_allocations": portfolio_decision.get("approved_allocations", []),
                 "profit_transfer": portfolio_decision.get("profit_transfer_amount", 0.0),
                 "timestamp": timestamp,
+                "execution_note": "Portfolio or conscience veto prevented execution.",
             }
 
         approved_allocations = portfolio_decision.get("approved_allocations", [])
@@ -52,7 +54,7 @@ class ExecutionService:
                 "approved_allocations": [],
                 "profit_transfer": 0.0,
                 "timestamp": timestamp,
-                "audit_note": "Run completed without deterministic side effects.",
+                "execution_note": "Run completed without deterministic side effects.",
             }
 
         research_only = (
@@ -64,7 +66,7 @@ class ExecutionService:
             )
         )
         status = "RESEARCH_RECORDED" if research_only else "EXECUTED"
-        audit_note = (
+        execution_note = (
             "Research-only candidate approvals were recorded; no broker order was placed."
             if research_only
             else "All agents were advisory only. Deterministic execution recorded approved actions."
@@ -76,7 +78,7 @@ class ExecutionService:
             "approved_allocations": approved_allocations,
             "profit_transfer": profit_transfer,
             "timestamp": timestamp,
-            "audit_note": audit_note
+            "execution_note": execution_note
         }
 
         # Save audit log

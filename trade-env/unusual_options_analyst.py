@@ -1200,11 +1200,68 @@ def build_candidate(
 
 
 # -------------------- main analysis --------------------
+UOA_HARD_REJECTION_REASONS = {
+    "not_buyer_initiated",
+    "not_clean_long_premium_flow",
+    "synthetic_or_complex_flow_risk",
+    "direction_not_directional",
+    "option_price_unavailable",
+    "non_positive_option_price",
+    "wide_bid_ask_spread",
+    "dte_outside_range",
+    "reward_risk_below_minimum",
+}
+
+UOA_SOFT_REJECTION_REASONS = {
+    "ask_side_ratio_below_threshold",
+    "total_premium_too_small",
+    "option_price_below_preferred_range",
+    "option_price_above_preferred_range",
+    "market_cap_above_preferred_range",
+    "volume_open_interest_ratio_below_threshold",
+    "post_flow_confirmation_unavailable",
+}
+
+
+def classify_uoa_reason(reason: str) -> str:
+    if reason in UOA_HARD_REJECTION_REASONS:
+        return "hard_failures"
+    if reason in UOA_SOFT_REJECTION_REASONS:
+        return "soft_failures"
+    if reason.startswith("post_flow_confirmation_contradicted") or reason.startswith("underlying_moved_against"):
+        return "hard_failures"
+    if reason.startswith("post_flow_confirmation_"):
+        return "soft_failures"
+    return "informational"
+
+
+def build_reason_buckets(reason_counts: Dict[str, int]) -> Dict[str, Dict[str, int]]:
+    buckets: Dict[str, Dict[str, int]] = {
+        "hard_failures": {},
+        "soft_failures": {},
+        "informational": {},
+    }
+    for reason, count in reason_counts.items():
+        bucket = classify_uoa_reason(reason)
+        buckets[bucket][reason] = count
+    return {
+        bucket: dict(sorted(values.items(), key=lambda kv: kv[1], reverse=True))
+        for bucket, values in buckets.items()
+    }
+
+
+def increment_reason_counts(target: Dict[str, int], reasons: List[str]) -> None:
+    for reason in reasons:
+        target[reason] = target.get(reason, 0) + 1
+
+
 def analyze_flow_dataframe(df: pd.DataFrame, config: RuntimeConfig) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = []
     rejected: List[Dict[str, Any]] = []
     watchlist: List[Dict[str, Any]] = []
     reason_counts: Dict[str, int] = {}
+    watchlist_reason_counts: Dict[str, int] = {}
+    rejected_reason_counts: Dict[str, int] = {}
     intraday_cache: Dict[str, Any] = {}
 
     for idx, row_series in df.iterrows():
@@ -1241,23 +1298,28 @@ def analyze_flow_dataframe(df: pd.DataFrame, config: RuntimeConfig) -> Tuple[Lis
         if guardrails["passed"] and score["fit_score"] >= config.min_fit_score:
             candidates.append(build_candidate(row, int(idx), guardrails, score, reward_risk, config, post_flow_confirmation))
         elif score["fit_score"] >= config.watchlist_min_fit_score:
+            increment_reason_counts(watchlist_reason_counts, guardrails["reasons"])
             watchlist.append({
                 "watchlist_id": candidate_id_from_row(row, int(idx)),
                 "symbol": safe_str(row.get("underlying_symbol")).upper(),
                 "status": "WATCHLIST",
                 "fit_score": score["fit_score"],
                 "reasons": guardrails["reasons"],
+                "reason_buckets": build_reason_buckets({reason: 1 for reason in guardrails["reasons"]}),
                 "summary": safe_str(row.get("string")),
                 "guardrails": guardrails,
                 "reward_risk": reward_risk,
                 "post_flow_confirmation": post_flow_confirmation,
             })
         else:
+            rejected_reasons = guardrails["reasons"] or ["fit_score_below_threshold"]
+            increment_reason_counts(rejected_reason_counts, rejected_reasons)
             rejected.append({
                 "symbol": safe_str(row.get("underlying_symbol")).upper(),
                 "row_number": int(idx) + 2,
                 "fit_score": score["fit_score"],
-                "reasons": guardrails["reasons"] or ["fit_score_below_threshold"],
+                "reasons": rejected_reasons,
+                "reason_buckets": build_reason_buckets({reason: 1 for reason in rejected_reasons}),
                 "contract": guardrails["contract"],
                 "quote": guardrails["quote"],
             })
@@ -1282,6 +1344,11 @@ def analyze_flow_dataframe(df: pd.DataFrame, config: RuntimeConfig) -> Tuple[Lis
         "watchlist_count_before_cap": int(len(watchlist)),
         "rejected_count": int(len(rejected)),
         "reason_counts": dict(sorted(reason_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "reason_buckets": build_reason_buckets(reason_counts),
+        "watchlist_reason_counts": dict(sorted(watchlist_reason_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "watchlist_reason_buckets": build_reason_buckets(watchlist_reason_counts),
+        "rejected_reason_counts": dict(sorted(rejected_reason_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "rejected_reason_buckets": build_reason_buckets(rejected_reason_counts),
     }
 
     return candidates[: config.max_candidates], watchlist[: config.max_watchlist], {**diagnostics, "rejected": rejected[:100]}

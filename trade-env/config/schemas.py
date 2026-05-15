@@ -39,6 +39,8 @@ class TradeCoordinatorOutput(BaseModel):
     ranking_weights: Dict[str, float]
     candidate_queue: List[Dict[str, Any]]
     no_trade: Optional[Dict[str, Any]] = None
+    trade_analysis: Dict[str, Any] = Field(default_factory=dict)
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     summary: str
 
 class PortfolioDecision(BaseModel):

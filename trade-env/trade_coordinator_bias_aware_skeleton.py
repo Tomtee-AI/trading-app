@@ -22,7 +22,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -686,6 +686,62 @@ def _candidate_symbol(candidate: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _parse_component_date(raw: Any) -> Optional[date]:
+    if raw is None:
+        return None
+    try:
+        return datetime.fromisoformat(str(raw)[:10]).date()
+    except ValueError:
+        return None
+
+
+def _collect_component_dates(obj: Any, path: str = "components") -> List[Dict[str, Any]]:
+    if isinstance(obj, dict):
+        found: List[Dict[str, Any]] = []
+        as_of = _parse_component_date(obj.get("as_of"))
+        if as_of is not None:
+            found.append({
+                "path": path,
+                "label": obj.get("label"),
+                "symbol": obj.get("symbol"),
+                "as_of": as_of,
+            })
+        for key, value in obj.items():
+            if isinstance(value, (dict, list)):
+                found.extend(_collect_component_dates(value, f"{path}.{key}"))
+        return found
+    if isinstance(obj, list):
+        found = []
+        for index, value in enumerate(obj):
+            found.extend(_collect_component_dates(value, f"{path}[{index}]"))
+        return found
+    return []
+
+
+def build_market_data_quality_warnings(market: Dict[str, Any]) -> List[Dict[str, Any]]:
+    dated_components = _collect_component_dates(market.get("components", {}))
+    if not dated_components:
+        return []
+
+    newest_as_of = max(item["as_of"] for item in dated_components)
+    warnings = []
+    for item in dated_components:
+        age_days = (newest_as_of - item["as_of"]).days
+        if age_days <= 0:
+            continue
+        warnings.append({
+            "warning_code": "MARKET_COMPONENT_STALE_AS_OF",
+            "path": item["path"],
+            "label": item.get("label"),
+            "symbol": item.get("symbol"),
+            "as_of": item["as_of"].isoformat(),
+            "newest_market_as_of": newest_as_of.isoformat(),
+            "age_days": age_days,
+            "severity": "WARNING" if age_days > 1 else "INFO",
+        })
+    return warnings
+
+
 def _extract_uoa_review(candidate: Dict[str, Any]) -> Dict[str, Any]:
     impl = candidate.get("implementation", {})
     selected = impl.get("selected_trade", {})
@@ -908,8 +964,9 @@ def build_candidate_review(candidate: Dict[str, Any], rank: int, duplicate_symbo
             strengths.append("Pair correlation is high enough for a cleaner relative-value signal.")
         if z is not None and abs(z) >= 2.0:
             strengths.append("Spread z-score is meaningfully extended.")
-        if short_rr is not None and long_rr is not None and min(short_rr, long_rr) < 1.25:
-            cautions.append("One leg has weak spread economics and may drag down the pair trade.")
+        leg_rrs = [rr_value for rr_value in [short_rr, long_rr] if rr_value is not None]
+        if leg_rrs and min(leg_rrs) < 2.0:
+            cautions.append(f"Weakest leg reward/risk is {min(leg_rrs):.2f}:1; review the pair legs separately.")
 
     if duplicate_symbol_count > 1:
         cautions.append(f"Duplicate exposure: {symbol} appears {duplicate_symbol_count} times in the forwarded queue.")
@@ -1000,6 +1057,7 @@ def build_trade_analysis(
     the most attention or caution.
     """
     forwarded = [row for row in candidate_queue if row.get("status") == "FORWARD"]
+    data_quality_warnings = build_market_data_quality_warnings(market)
     strategy_counts: Dict[str, int] = {strategy: 0 for strategy in ALLOWED_STRATEGIES}
     symbol_counts: Dict[str, int] = {}
     for row in forwarded:
@@ -1014,6 +1072,8 @@ def build_trade_analysis(
             "strategy_mix": strategy_counts,
             "top_recommendations": {},
             "reviews": [],
+            "final_ideas": [],
+            "data_quality_warnings": data_quality_warnings,
             "plain_english_summary": [no_trade.get("summary", "No trade was forwarded.")],
         }
 
@@ -1046,6 +1106,10 @@ def build_trade_analysis(
         plain_summary.append(f"Best aggressive/moonshot profile: {best_moonshot['symbol']} with estimated R/R {rr_text}.")
     if most_caution:
         plain_summary.append(f"Highest-caution forwarded idea: {most_caution['symbol']} — {'; '.join(most_caution.get('cautions', [])[:2])}.")
+    if data_quality_warnings:
+        plain_summary.append(
+            f"Data freshness note: {len(data_quality_warnings)} market component(s) lag the newest as-of date."
+        )
 
     return {
         "analysis_version": "1.0.0",
@@ -1059,6 +1123,8 @@ def build_trade_analysis(
             "one_to_review_or_avoid": _summary_stub(most_caution),
         },
         "reviews": reviews,
+        "final_ideas": [_summary_stub(review) for review in reviews],
+        "data_quality_warnings": data_quality_warnings,
         "plain_english_summary": plain_summary,
         "execution_reminder": (
             "FORWARD means the idea passed coordinator filters; it is not an order instruction. "
