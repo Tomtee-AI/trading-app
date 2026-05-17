@@ -4,7 +4,7 @@ Date: 2026-05-11
 
 ## Purpose
 
-Refactor ZeroHumanCompany into a deterministic, rules-first trading research engine. The system should convert `rules.docx` into executable constraints, produce shared `TradeCandidate` objects across all strategy analysts, and emit a coordinator output that can format the exact trading report the rules require without inventing prices, catalysts, premiums, or liquidity.
+Refactor the trading app into a deterministic, rules-first trading research engine. The system should convert `rules.docx` into executable constraints, produce shared `TradeCandidate` objects across all strategy analysts, and emit a coordinator output that can format the exact trading report the rules require without inventing prices, catalysts, premiums, or liquidity.
 
 This plan starts from the current codebase:
 
